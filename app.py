@@ -33,6 +33,8 @@ from ingestion.pdf_parser import (
     ParsedPDF,
     extract_text_from_pdf,
 )
+from rag.pipeline import RAGPipeline
+from rag.qa import QAResult, ReportQAEngine
 
 # Set page configuration
 st.set_page_config(
@@ -199,7 +201,14 @@ def render_sidebar() -> Tuple[Optional[str], Optional[str]]:
                 st.write(f"**Years Extracted:** {len(report.annual_reports)}")
 
             if st.button("🔄 Clear / Reset", use_container_width=True):
-                for key in ["parsed_pdf", "extraction_report", "ratios", "uploaded_filename"]:
+                for key in [
+                    "parsed_pdf",
+                    "extraction_report",
+                    "ratios",
+                    "uploaded_filename",
+                    "rag_pipeline",
+                    "qa_messages",
+                ]:
                     st.session_state.pop(key, None)
                 st.rerun()
 
@@ -273,6 +282,16 @@ def run_pipeline(
             st.error(f"Failed to calculate ratios: {e}")
             status.update(label="Ratio calculation failed", state="error")
             return False
+
+        # Step 4: Index Document in RAG Pipeline for Q&A
+        status.update(label="4/4: Indexing document passages for report Q&A...")
+        try:
+            rag_pipeline = RAGPipeline()
+            rag_pipeline.ingest(parsed_pdf)
+            st.session_state.rag_pipeline = rag_pipeline
+            st.session_state.qa_messages = []
+        except Exception as e:
+            st.warning(f"Note: RAG indexing encountered an issue: {e}")
 
         status.update(label="Analysis complete!", state="complete", expanded=False)
 
@@ -689,6 +708,105 @@ def render_financial_tables(
         st.dataframe(pd.DataFrame(ratio_table).set_index("Financial Ratio"), use_container_width=True)
 
 
+def get_or_create_rag_pipeline(parsed_pdf: Optional[ParsedPDF]) -> Optional[RAGPipeline]:
+    """Retrieve existing RAG pipeline from session state or index the parsed PDF."""
+    if "rag_pipeline" in st.session_state and st.session_state.rag_pipeline is not None:
+        return st.session_state.rag_pipeline
+    if parsed_pdf is not None and parsed_pdf.pages:
+        pipeline = RAGPipeline()
+        pipeline.ingest(parsed_pdf)
+        st.session_state.rag_pipeline = pipeline
+        return pipeline
+    return None
+
+
+def render_qa_chat(api_key: Optional[str], model_name: str) -> None:
+    """Render interactive report-grounded Q&A chat section."""
+    st.subheader("💬 Ask Questions About This Report")
+    st.caption(
+        "Ask questions about financial performance, risks, disclosures, or footnotes. "
+        "Answers are strictly grounded in retrieved passages from the uploaded report with source page citations (e.g., [Page 4])."
+    )
+
+    # Initialize chat history if not present
+    if "qa_messages" not in st.session_state:
+        st.session_state.qa_messages = []
+
+    # Get or lazily initialize the RAG pipeline from the cached parsed_pdf
+    parsed_pdf = st.session_state.get("parsed_pdf")
+    pipeline = get_or_create_rag_pipeline(parsed_pdf)
+
+    # Status / Info and clear conversation
+    col_info, col_clear = st.columns([4, 1])
+    with col_info:
+        if pipeline and pipeline.chunk_count > 0:
+            st.markdown(
+                f"<small style='color: #64748B;'>Indexed <b>{pipeline.chunk_count}</b> passages across <b>{len(pipeline.indexed_pages)}</b> pages ready for Q&A.</small>",
+                unsafe_allow_html=True,
+            )
+        else:
+            st.info("No report text is currently indexed for Q&A.")
+            return
+
+    with col_clear:
+        if st.session_state.qa_messages:
+            if st.button("🗑️ Clear Chat", key="clear_chat_btn", use_container_width=True):
+                st.session_state.qa_messages = []
+                st.rerun()
+
+    # Display chat history
+    for msg in st.session_state.qa_messages:
+        with st.chat_message(msg["role"]):
+            st.markdown(msg["content"])
+            # Display source citations expander if available
+            sources = msg.get("sources")
+            if sources:
+                with st.expander(f"📄 Retrieved Sources ({len(sources)} passages)", expanded=False):
+                    for idx, src in enumerate(sources):
+                        st.markdown(f"**[Page {src['page_number']}]** (Score: `{src['score']:.2f}`):")
+                        st.markdown(f"> *{src['text']}*")
+                        if idx < len(sources) - 1:
+                            st.markdown("---")
+
+    # Chat input
+    user_query = st.chat_input("Ask a question about this report (e.g., 'What are the principal risk factors?')...")
+    if user_query:
+        if not api_key:
+            st.error("⚠️ Gemini API key is required to answer questions. Please provide it in the sidebar.")
+            return
+
+        # Record user question
+        st.session_state.qa_messages.append({"role": "user", "content": user_query})
+
+        with st.spinner("Searching report passages and generating grounded answer..."):
+            qa_engine = ReportQAEngine(
+                api_key=api_key,
+                model_name=model_name,
+                top_k=5,
+            )
+            qa_result = qa_engine.answer_question(user_query, pipeline)
+
+            # Format source summaries
+            source_summaries = [
+                {
+                    "page_number": r.page_number,
+                    "score": r.score,
+                    "text": r.text[:350] + ("..." if len(r.text) > 350 else ""),
+                }
+                for r in qa_result.sources
+            ]
+
+            st.session_state.qa_messages.append({
+                "role": "assistant",
+                "content": qa_result.answer,
+                "sources": source_summaries,
+                "cited_pages": qa_result.cited_pages,
+                "has_insufficient_evidence": qa_result.has_insufficient_evidence,
+            })
+
+        st.rerun()
+
+
 def render_audit_and_validation(report: FinancialExtractionReport) -> None:
     """Render audit notices, missing fields breakdown, and extraction warnings."""
     with st.expander("🔍 Extraction & Audit Details", expanded=False):
@@ -739,6 +857,9 @@ def main() -> None:
         # Check if we need to run the extraction pipeline
         current_filename = st.session_state.get("uploaded_filename")
         if current_filename != uploaded_file.name or "extraction_report" not in st.session_state:
+            if current_filename != uploaded_file.name:
+                st.session_state.qa_messages = []
+                st.session_state.pop("rag_pipeline", None)
             process_btn = st.button("🚀 Analyze Report", type="primary", use_container_width=True)
             if process_btn:
                 success = run_pipeline(uploaded_file, api_key, model_name)
@@ -793,7 +914,11 @@ def main() -> None:
         render_financial_tables(report.annual_reports, ratios)
         st.markdown("---")
 
-        # 4. Audit & Validation Notices
+        # 4. Report-Grounded Q&A Chat
+        render_qa_chat(api_key, model_name)
+        st.markdown("---")
+
+        # 5. Audit & Validation Notices
         render_audit_and_validation(report)
 
     elif uploaded_file is None:
