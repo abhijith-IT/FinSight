@@ -7,6 +7,7 @@ interactive KPI cards and Plotly trend visualizations.
 
 from __future__ import annotations
 
+import hashlib
 import io
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -33,6 +34,7 @@ from ingestion.pdf_parser import (
     ParsedPDF,
     extract_text_from_pdf,
 )
+from generation.summary import ExecutiveSummary, ExecutiveSummaryGenerator
 from rag.pipeline import RAGPipeline
 from rag.qa import QAResult, ReportQAEngine
 
@@ -86,6 +88,42 @@ st.markdown(
     """,
     unsafe_allow_html=True,
 )
+
+
+REPORT_STATE_KEYS: List[str] = [
+    "parsed_pdf",
+    "extraction_report",
+    "ratios",
+    "uploaded_filename",
+    "uploaded_file_hash",
+    "rag_pipeline",
+    "qa_messages",
+    "executive_summary",
+]
+
+
+def compute_pdf_hash(file_bytes: bytes) -> str:
+    """Compute SHA-256 hash of PDF bytes to uniquely identify document content."""
+    return hashlib.sha256(file_bytes).hexdigest()
+
+
+def extract_file_bytes(uploaded_file: Any) -> bytes:
+    """Safely extract bytes from an uploaded file or file-like object."""
+    if hasattr(uploaded_file, "getvalue"):
+        return uploaded_file.getvalue()
+    if hasattr(uploaded_file, "read"):
+        pos = uploaded_file.tell() if hasattr(uploaded_file, "tell") else None
+        data = uploaded_file.read()
+        if pos is not None and hasattr(uploaded_file, "seek"):
+            uploaded_file.seek(pos)
+        return data
+    raise ValueError("Unsupported uploaded_file type: must support getvalue() or read()")
+
+
+def clear_report_state() -> None:
+    """Clear all report-specific session state to prevent stale data reuse."""
+    for key in REPORT_STATE_KEYS:
+        st.session_state.pop(key, None)
 
 
 def format_currency_value(
@@ -201,20 +239,12 @@ def render_sidebar() -> Tuple[Optional[str], Optional[str]]:
                 st.write(f"**Years Extracted:** {len(report.annual_reports)}")
 
             if st.button("🔄 Clear / Reset", use_container_width=True):
-                for key in [
-                    "parsed_pdf",
-                    "extraction_report",
-                    "ratios",
-                    "uploaded_filename",
-                    "rag_pipeline",
-                    "qa_messages",
-                ]:
-                    st.session_state.pop(key, None)
+                clear_report_state()
                 st.rerun()
 
         st.markdown("---")
         st.markdown(
-            "<small style='color: #94A3B8;'>FinSight Dashboard v1.0<br>Milestone 4: Structured Intelligence</small>",
+            "<small style='color: #94A3B8;'>FinSight Dashboard v1.0</small>",
             unsafe_allow_html=True,
         )
 
@@ -222,40 +252,49 @@ def render_sidebar() -> Tuple[Optional[str], Optional[str]]:
 
 
 def run_pipeline(
-    uploaded_file,
+    uploaded_file: Any,
     api_key: Optional[str],
     model_name: str,
+    file_bytes: Optional[bytes] = None,
+    file_hash: Optional[str] = None,
 ) -> bool:
     """Execute PDF parsing, LLM financial extraction, and ratio calculation."""
     if not api_key:
         st.error("⚠️ Gemini API Key is required to extract financial statements. Please provide it in the sidebar.")
         return False
 
+    if file_bytes is None:
+        file_bytes = extract_file_bytes(uploaded_file)
+    if file_hash is None:
+        file_hash = compute_pdf_hash(file_bytes)
+
+    filename = getattr(uploaded_file, "name", "document.pdf")
+
     with st.status("Analyzing Financial Report...", expanded=True) as status:
         # Step 1: PDF Ingestion & Text Parsing
-        status.update(label="1/3: Parsing PDF pages with pdfplumber...")
+        status.update(label="1/5: Parsing PDF pages with pdfplumber...")
         try:
-            file_bytes = uploaded_file.getvalue()
             pdf_stream = io.BytesIO(file_bytes)
-            setattr(pdf_stream, "name", uploaded_file.name)
+            setattr(pdf_stream, "name", filename)
             parsed_pdf = extract_text_from_pdf(pdf_stream)
-            st.session_state.parsed_pdf = parsed_pdf
-            st.session_state.uploaded_filename = uploaded_file.name
         except EmptyPDFError as e:
             st.error(f"Cannot process PDF: {e}")
             status.update(label="Extraction failed: Empty PDF", state="error")
+            clear_report_state()
             return False
         except InvalidPDFError as e:
             st.error(f"Invalid or corrupted PDF file: {e}")
             status.update(label="Extraction failed: Corrupted PDF", state="error")
+            clear_report_state()
             return False
         except Exception as e:
             st.error(f"Unexpected error while parsing PDF: {e}")
             status.update(label="Extraction failed", state="error")
+            clear_report_state()
             return False
 
         # Step 2: Gemini Structured Statement Extraction
-        status.update(label="2/3: Extracting structured financial statements with Gemini...")
+        status.update(label="2/5: Extracting structured financial statements with Gemini...")
         try:
             extractor = FinancialExtractor(
                 api_key=api_key,
@@ -263,35 +302,58 @@ def run_pipeline(
                 max_pages_per_section=4,
             )
             extraction_report = extractor.extract(parsed_pdf)
-            st.session_state.extraction_report = extraction_report
         except ExtractionError as e:
             st.error(f"Financial extraction error: {e}")
             status.update(label="Extraction failed: LLM Error", state="error")
+            clear_report_state()
             return False
         except Exception as e:
             st.error(f"Failed to extract financial data: {e}")
             status.update(label="Extraction failed", state="error")
+            clear_report_state()
             return False
 
         # Step 3: Pure Python Financial Ratio Engine
-        status.update(label="3/3: Computing financial ratios and verifying consistency...")
+        status.update(label="3/5: Computing financial ratios and verifying consistency...")
         try:
             ratios_list = calculate_report_ratios(extraction_report)
-            st.session_state.ratios = ratios_list
         except Exception as e:
             st.error(f"Failed to calculate ratios: {e}")
             status.update(label="Ratio calculation failed", state="error")
+            clear_report_state()
             return False
 
         # Step 4: Index Document in RAG Pipeline for Q&A
-        status.update(label="4/4: Indexing document passages for report Q&A...")
+        status.update(label="4/5: Indexing document passages for report Q&A...")
+        rag_pipeline: Optional[RAGPipeline] = None
         try:
             rag_pipeline = RAGPipeline()
-            rag_pipeline.ingest(parsed_pdf)
-            st.session_state.rag_pipeline = rag_pipeline
-            st.session_state.qa_messages = []
+            rag_pipeline.ingest(parsed_pdf, doc_id=filename)
         except Exception as e:
             st.warning(f"Note: RAG indexing encountered an issue: {e}")
+
+        # Step 5: Generate AI Executive Summary
+        status.update(label="5/5: Generating AI Executive Summary...")
+        exec_summary: Optional[ExecutiveSummary] = None
+        try:
+            summary_gen = ExecutiveSummaryGenerator(api_key=api_key, model_name=model_name)
+            exec_summary = summary_gen.generate_summary(
+                report=extraction_report,
+                ratios=ratios_list,
+                pipeline=rag_pipeline,
+            )
+        except Exception as e:
+            st.warning(f"Note: AI Executive Summary generation encountered an issue ({e}). You can generate it from the dashboard.")
+
+        # Commit fresh report state atomically to session state
+        st.session_state.parsed_pdf = parsed_pdf
+        st.session_state.uploaded_filename = filename
+        st.session_state.uploaded_file_hash = file_hash
+        st.session_state.extraction_report = extraction_report
+        st.session_state.ratios = ratios_list
+        st.session_state.rag_pipeline = rag_pipeline
+        st.session_state.qa_messages = []
+        st.session_state.executive_summary = exec_summary
 
         status.update(label="Analysis complete!", state="complete", expanded=False)
 
@@ -807,6 +869,50 @@ def render_qa_chat(api_key: Optional[str], model_name: str) -> None:
         st.rerun()
 
 
+def render_executive_summary_section(
+    report: FinancialExtractionReport,
+    ratios: List[FinancialRatios],
+    api_key: Optional[str],
+    model_name: str,
+) -> None:
+    """Render prominent AI Executive Summary briefing with cached generation."""
+    st.subheader("📋 AI Executive Summary")
+
+    cached_summary: Optional[ExecutiveSummary] = st.session_state.get("executive_summary")
+
+    # Header control row: Metadata on left, Regenerate / Generate button on right
+    col_meta, col_btn = st.columns([4, 1])
+
+    with col_meta:
+        if cached_summary and not cached_summary.error:
+            cited_str = f" • Sources: {', '.join(f'Page {p}' for p in cached_summary.cited_pages)}" if cached_summary.cited_pages else ""
+            st.caption(f"🤖 Generated by **{cached_summary.model_used or model_name}** at {cached_summary.generated_at}{cited_str}")
+        else:
+            st.caption("AI strategic briefing combining verified statement data, calculated ratios, and reported management disclosures.")
+
+    with col_btn:
+        regen_label = "🔄 Regenerate" if cached_summary else "✨ Generate Summary"
+        if st.button(regen_label, key="gen_summary_btn", use_container_width=True):
+            if not api_key:
+                st.error("⚠️ Gemini API key is required to generate the executive summary. Please configure it in the sidebar.")
+                return
+            with st.spinner("Analyzing multi-year performance and synthesizing executive briefing..."):
+                pipeline = get_or_create_rag_pipeline(st.session_state.get("parsed_pdf"))
+                generator = ExecutiveSummaryGenerator(api_key=api_key, model_name=model_name)
+                st.session_state.executive_summary = generator.generate_summary(report, ratios, pipeline)
+            st.rerun()
+
+    # Display cached summary
+    cached_summary = st.session_state.get("executive_summary")
+    if cached_summary:
+        if cached_summary.error:
+            st.warning(f"Executive Summary Notice: {cached_summary.error}")
+        with st.container(border=True):
+            st.markdown(cached_summary.summary_text)
+    else:
+        st.info("Click **✨ Generate Summary** to synthesize an executive briefing for this report.")
+
+
 def render_audit_and_validation(report: FinancialExtractionReport) -> None:
     """Render audit notices, missing fields breakdown, and extraction warnings."""
     with st.expander("🔍 Extraction & Audit Details", expanded=False):
@@ -853,25 +959,48 @@ def main() -> None:
         help="Upload a corporate financial report or 10-K document (PDF).",
     )
 
-    if uploaded_file is not None:
-        # Check if we need to run the extraction pipeline
-        current_filename = st.session_state.get("uploaded_filename")
-        if current_filename != uploaded_file.name or "extraction_report" not in st.session_state:
-            if current_filename != uploaded_file.name:
-                st.session_state.qa_messages = []
-                st.session_state.pop("rag_pipeline", None)
-            process_btn = st.button("🚀 Analyze Report", type="primary", use_container_width=True)
-            if process_btn:
-                success = run_pipeline(uploaded_file, api_key, model_name)
-                if not success:
-                    st.stop()
-                st.rerun()
-            else:
-                st.info(f"Ready to analyze **{uploaded_file.name}**. Click **Analyze Report** above to start.")
-                st.stop()
+    if uploaded_file is None:
+        # If user removed the file, clear any lingering report state and prompt upload
+        if st.session_state.get("uploaded_file_hash") is not None or "extraction_report" in st.session_state:
+            clear_report_state()
+            st.rerun()
+        st.info("👆 Upload an annual report PDF to begin extracting and analyzing financial statements.")
+        return
 
-    # Display Dashboard Results if available in session state
-    if "extraction_report" in st.session_state and st.session_state.extraction_report:
+    # Process upload from actual bytes and content hash
+    file_bytes = extract_file_bytes(uploaded_file)
+    file_hash = compute_pdf_hash(file_bytes)
+    current_hash = st.session_state.get("uploaded_file_hash")
+
+    # If the PDF changed (different content hash), clear all report-specific state immediately
+    if current_hash is not None and current_hash != file_hash:
+        clear_report_state()
+        st.rerun()
+
+    # Rebuild extraction if not yet extracted for this document
+    if "extraction_report" not in st.session_state or current_hash != file_hash:
+        process_btn = st.button("🚀 Analyze Report", type="primary", use_container_width=True)
+        if process_btn:
+            success = run_pipeline(
+                uploaded_file=uploaded_file,
+                api_key=api_key,
+                model_name=model_name,
+                file_bytes=file_bytes,
+                file_hash=file_hash,
+            )
+            if not success:
+                st.stop()
+            st.rerun()
+        else:
+            st.info(f"Ready to analyze **{uploaded_file.name}**. Click **Analyze Report** above to start.")
+            st.stop()
+
+    # Display Dashboard Results only if extraction matches current uploaded file hash
+    if (
+        "extraction_report" in st.session_state
+        and st.session_state.extraction_report
+        and st.session_state.get("uploaded_file_hash") == file_hash
+    ):
         report: FinancialExtractionReport = st.session_state.extraction_report
 
         # Ensure all annual reports conform to schema (reconcile any older cached session objects)
@@ -902,6 +1031,10 @@ def main() -> None:
 
         st.markdown(f"### {comp_name} <small style='color: #64748B;'>({year_span}{scale_tag})</small>", unsafe_allow_html=True)
 
+        # AI Executive Summary Briefing
+        render_executive_summary_section(report, ratios, api_key, model_name)
+        st.markdown("---")
+
         # 1. KPI Cards
         render_kpis(report.annual_reports, ratios)
         st.markdown("---")
@@ -920,9 +1053,6 @@ def main() -> None:
 
         # 5. Audit & Validation Notices
         render_audit_and_validation(report)
-
-    elif uploaded_file is None:
-        st.info("👆 Upload an annual report PDF to begin extracting and analyzing financial statements.")
 
 
 if __name__ == "__main__":
