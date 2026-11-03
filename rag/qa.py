@@ -6,7 +6,9 @@ Gemini model to generate strictly grounded answers with page citations ([Page X]
 
 from __future__ import annotations
 
+import random
 import re
+import time
 from typing import Any, Dict, List, Optional, Set
 
 from google import genai
@@ -25,7 +27,7 @@ MANDATORY GROUNDING RULES:
 1. STRICT GROUNDING: Answer using ONLY facts directly reported in the provided passages. NEVER use prior knowledge, speculate, or extrapolate facts not present in the text.
 2. CITATIONS: Every claim, financial metric, and statement MUST cite the source page number using the format [Page X] (e.g., [Page 4], [Page 12]) corresponding to the page heading where the evidence was found.
 3. NEVER INVENT CITATIONS: Only cite page numbers that exist in the provided passages. Never guess or fabricate page numbers.
-4. INSUFFICIENT EVIDENCE: If the provided passages do not contain sufficient evidence to answer the question, state clearly: "The provided report passages do not contain sufficient evidence to answer this question." Do not attempt to guess or invent facts.
+4. INSUFFICIENT EVIDENCE: If the provided passages do not contain sufficient evidence or information to answer the question, state clearly: "The report does not contain enough information to answer this question." Do not attempt to guess or invent facts.
 5. OBJECTIVE & PRECISE: Maintain a concise, objective financial tone. Present numbers, currencies, and scale units accurately as stated in the text.
 """
 
@@ -49,6 +51,10 @@ class QAResult(BaseModel):
         default=False,
         description="True if the evidence was insufficient to answer the question",
     )
+    model_used: Optional[str] = Field(
+        default=None,
+        description="Gemini model name used to generate the answer",
+    )
     error: Optional[str] = Field(
         default=None,
         description="Error message if retrieval or generation failed",
@@ -62,24 +68,37 @@ class ReportQAEngine:
         self,
         api_key: Optional[str] = None,
         model_name: Optional[str] = None,
+        fallback_model_name: Optional[str] = None,
         client: Optional[genai.Client] = None,
         top_k: int = 5,
         min_score: float = 0.0,
+        max_retries: int = 3,
+        base_delay_seconds: float = 0.1,
     ) -> None:
         """Initialize the ReportQAEngine.
 
         Args:
             api_key: Gemini API key. Defaults to config.GEMINI_API_KEY.
-            model_name: Gemini model name. Defaults to config.GEMINI_MODEL.
-            client: Optional pre-configured genai.Client (useful for testing and dependency injection).
+            model_name: Primary Gemini model name. Defaults to config.GEMINI_MODEL.
+            fallback_model_name: Optional fallback model if primary is unavailable.
+            client: Optional pre-configured genai.Client instance.
             top_k: Default number of relevant chunks to retrieve.
             min_score: Minimum relevance score threshold for retrieval.
+            max_retries: Maximum retries for transient 503/429 errors.
+            base_delay_seconds: Base delay for exponential backoff.
         """
         self.api_key = api_key or getattr(config, "GEMINI_API_KEY", None)
         self.model_name = model_name or getattr(config, "GEMINI_MODEL", "gemini-3.8-flash")
+        self.fallback_model_name = (
+            fallback_model_name
+            if fallback_model_name is not None
+            else getattr(config, "GEMINI_FALLBACK_MODEL", "gemini-3.5-flash-lite")
+        )
         self._client = client
         self.top_k = top_k
         self.min_score = min_score
+        self.max_retries = max_retries
+        self.base_delay_seconds = base_delay_seconds
 
     @property
     def client(self) -> genai.Client:
@@ -152,7 +171,7 @@ class ReportQAEngine:
         if not results:
             return QAResult(
                 question=clean_question,
-                answer="The provided report passages do not contain sufficient evidence to answer this question.",
+                answer="The report does not contain enough information to answer this question. (The provided report passages do not contain sufficient evidence.)",
                 sources=[],
                 cited_pages=[],
                 has_insufficient_evidence=True,
@@ -175,7 +194,7 @@ class ReportQAEngine:
             f"Instructions:\n"
             f"- Answer the question using ONLY the passages above.\n"
             f"- Include [Page X] citations for every statement or number.\n"
-            f"- If the passages lack sufficient evidence, state clearly that the provided report passages do not contain sufficient evidence to answer this question."
+            f"- If the passages lack sufficient evidence, state clearly that the report does not contain enough information to answer this question."
         )
 
         generate_config = types.GenerateContentConfig(
@@ -183,25 +202,25 @@ class ReportQAEngine:
             temperature=0.0,
         )
 
-        # Generate answer with Gemini
-        try:
-            response = self.client.models.generate_content(
-                model=self.model_name,
-                contents=prompt,
-                config=generate_config,
-            )
-            raw_answer = getattr(response, "text", "") or ""
-            if not raw_answer.strip():
-                raw_answer = "The provided report passages do not contain sufficient evidence to answer this question."
-        except Exception as api_err:
+        # Execute generation with retry and fallback
+        raw_answer, model_used, error_msg = self._generate_with_retry_and_fallback(
+            prompt=prompt,
+            config=generate_config,
+        )
+
+        if error_msg:
             return QAResult(
                 question=clean_question,
-                answer=f"Gemini API request failed: {api_err}",
+                answer=f"Gemini API request failed: {error_msg}",
                 sources=results,
                 cited_pages=sorted(retrieved_pages),
                 has_insufficient_evidence=False,
-                error=str(api_err),
+                model_used=model_used,
+                error=error_msg,
             )
+
+        if not raw_answer.strip():
+            raw_answer = "The report does not contain enough information to answer this question. (The provided report passages do not contain sufficient evidence.)"
 
         # Extract [Page X] citations and reconcile with actual retrieved pages
         cited_matches = re.findall(r"\[Page\s+(\d+)\]", raw_answer, re.IGNORECASE)
@@ -210,11 +229,17 @@ class ReportQAEngine:
         # Detect insufficient evidence phrasing
         lower_ans = raw_answer.lower()
         insufficient_evidence = (
-            "insufficient evidence" in lower_ans
+            "not contain enough information" in lower_ans
+            or "does not contain enough information" in lower_ans
+            or "not provide enough information" in lower_ans
+            or "does not provide enough information" in lower_ans
+            or "insufficient evidence" in lower_ans
             or "not contain sufficient evidence" in lower_ans
             or "does not contain sufficient evidence" in lower_ans
             or "cannot be answered from the provided" in lower_ans
             or "not mentioned in the provided" in lower_ans
+            or "not found in the provided" in lower_ans
+            or "not reported in the provided" in lower_ans
         )
 
         return QAResult(
@@ -223,4 +248,48 @@ class ReportQAEngine:
             sources=results,
             cited_pages=cited_pages,
             has_insufficient_evidence=insufficient_evidence,
+            model_used=model_used,
         )
+
+    def _generate_with_retry_and_fallback(
+        self,
+        prompt: str,
+        config: types.GenerateContentConfig,
+    ) -> tuple[str, Optional[str], Optional[str]]:
+        """Call Gemini model with bounded exponential backoff and fallback model support."""
+        models_to_try = [self.model_name]
+        if self.fallback_model_name and self.fallback_model_name != self.model_name:
+            models_to_try.append(self.fallback_model_name)
+
+        last_error = None
+
+        for m_idx, current_model in enumerate(models_to_try):
+            for attempt in range(self.max_retries + 1):
+                try:
+                    response = self.client.models.generate_content(
+                        model=current_model,
+                        contents=prompt,
+                        config=config,
+                    )
+                    text = getattr(response, "text", "") or ""
+                    return text, current_model, None
+                except Exception as e:
+                    last_error = e
+                    err_str = str(e).lower()
+                    is_transient = any(
+                        term in err_str
+                        for term in ["503", "429", "unavailable", "resource_exhausted", "timeout"]
+                    )
+                    # Non-transient errors (like invalid API key) should not be retried
+                    if not is_transient:
+                        return "", current_model, str(e)
+
+                    if attempt < self.max_retries:
+                        delay = self.base_delay_seconds * (2 ** attempt) + random.uniform(0.1, 0.4)
+                        time.sleep(delay)
+                        continue
+
+            # If retries exhausted for primary model, proceed to fallback model
+            continue
+
+        return "", None, str(last_error) if last_error else "API request failed"

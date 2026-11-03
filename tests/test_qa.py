@@ -45,8 +45,11 @@ class TestReportQAEngine(unittest.TestCase):
         self.qa_engine = ReportQAEngine(
             api_key="mock_key",
             model_name="gemini-3.1-flash-lite",
+            fallback_model_name=None,
             client=self.mock_client,
             top_k=3,
+            max_retries=1,
+            base_delay_seconds=0.01,
         )
 
     def test_evidence_grounded_answer_with_citations(self) -> None:
@@ -144,6 +147,53 @@ class TestReportQAEngine(unittest.TestCase):
         res_empty_pipe = self.qa_engine.answer_question("What is revenue?", empty_pipe)
         self.assertTrue(res_empty_pipe.has_insufficient_evidence)
         self.assertIn("not been indexed", res_empty_pipe.answer)
+
+    def test_transient_error_retry_and_fallback_model(self) -> None:
+        """Verify engine retries transient 503 and switches to fallback model."""
+        mock_resp = MagicMock()
+        mock_resp.text = "Grounded answer from fallback model [Page 4]."
+
+        def generate_mock(model, contents, config):
+            if model == "gemini-3.8-flash":
+                raise Exception("503 Service Unavailable")
+            return mock_resp
+
+        self.mock_client.models.generate_content.side_effect = generate_mock
+
+        qa = ReportQAEngine(
+            api_key="mock_key",
+            model_name="gemini-3.8-flash",
+            fallback_model_name="gemini-3.5-flash-lite",
+            client=self.mock_client,
+            top_k=2,
+            max_retries=1,
+            base_delay_seconds=0.01,
+        )
+
+        result = qa.answer_question("What was revenue?", self.pipeline)
+        self.assertFalse(result.has_insufficient_evidence)
+        self.assertIn("fallback model", result.answer)
+        self.assertEqual(result.model_used, "gemini-3.5-flash-lite")
+        self.assertIn(4, result.cited_pages)
+
+    def test_unsupported_out_of_scope_question_with_retrieved_evidence(self) -> None:
+        """Verify model returns insufficient evidence when question cannot be answered from passages."""
+        mock_resp = MagicMock()
+        mock_resp.text = "The report does not contain enough information to answer this question."
+        self.mock_client.models.generate_content.return_value = mock_resp
+
+        result = self.qa_engine.answer_question("What was revenue and the CEO's patent number?", self.pipeline)
+        self.assertTrue(result.has_insufficient_evidence)
+        self.assertIn("not contain enough information", result.answer)
+
+    def test_non_transient_error_fails_immediately_without_retries(self) -> None:
+        """Verify non-transient error like invalid API key does not trigger wasteful retries."""
+        self.mock_client.models.generate_content.side_effect = Exception("400 Bad Request: Invalid API key")
+        result = self.qa_engine.answer_question("What was revenue?", self.pipeline)
+
+        self.assertIsNotNone(result.error)
+        self.assertIn("Invalid API key", result.error)
+        self.assertEqual(self.mock_client.models.generate_content.call_count, 1)
 
 
 if __name__ == "__main__":

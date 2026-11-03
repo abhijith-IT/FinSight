@@ -35,7 +35,7 @@ from ingestion.pdf_parser import (
     extract_text_from_pdf,
 )
 from generation.summary import ExecutiveSummary, ExecutiveSummaryGenerator
-from rag.pipeline import RAGPipeline
+from rag.pipeline import RAGPipeline, create_rag_pipeline
 from rag.qa import QAResult, ReportQAEngine
 
 # Set page configuration
@@ -371,12 +371,16 @@ def run_pipeline(
             clear_report_state()
             return False
 
-        # Step 4: Index Document in RAG Pipeline for Q&A
+        # Step 4: Index Document in RAG Pipeline for Q&A (Cached)
         status.update(label="4/5: Indexing document passages for report Q&A...")
         rag_pipeline: Optional[RAGPipeline] = None
         try:
-            rag_pipeline = RAGPipeline()
-            rag_pipeline.ingest(parsed_pdf, doc_id=filename)
+            rag_pipeline = get_or_create_rag_pipeline(
+                parsed_pdf=parsed_pdf,
+                api_key=api_key,
+                file_hash=file_hash,
+                doc_id=filename,
+            )
         except Exception as e:
             st.warning(f"Note: RAG indexing encountered an issue: {e}")
 
@@ -827,13 +831,41 @@ def render_financial_tables(
         st.dataframe(pd.DataFrame(ratio_table).set_index("Financial Ratio"), use_container_width=True)
 
 
-def get_or_create_rag_pipeline(parsed_pdf: Optional[ParsedPDF]) -> Optional[RAGPipeline]:
-    """Retrieve existing RAG pipeline from session state or index the parsed PDF."""
+@st.cache_resource(show_spinner=False)
+def get_cached_rag_pipeline(
+    file_hash: str,
+    _parsed_pdf: ParsedPDF,
+    api_key: Optional[str] = None,
+    doc_id: Optional[str] = None,
+) -> RAGPipeline:
+    """Create and cache the RAGPipeline with indexed document chunks and embeddings."""
+    pipeline = create_rag_pipeline(
+        api_key=api_key,
+        retriever_type="hybrid" if api_key else "bm25",
+    )
+    pipeline.ingest(_parsed_pdf, doc_id=doc_id)
+    return pipeline
+
+
+def get_or_create_rag_pipeline(
+    parsed_pdf: Optional[ParsedPDF],
+    api_key: Optional[str] = None,
+    file_hash: Optional[str] = None,
+    doc_id: Optional[str] = None,
+) -> Optional[RAGPipeline]:
+    """Retrieve existing RAG pipeline from session state or cached resource."""
     if "rag_pipeline" in st.session_state and st.session_state.rag_pipeline is not None:
         return st.session_state.rag_pipeline
     if parsed_pdf is not None and parsed_pdf.pages:
-        pipeline = RAGPipeline()
-        pipeline.ingest(parsed_pdf)
+        effective_hash = file_hash or st.session_state.get("uploaded_file_hash") or "default_doc"
+        effective_doc_id = doc_id or st.session_state.get("uploaded_filename", "document.pdf")
+        effective_api_key = api_key or getattr(config, "GEMINI_API_KEY", None)
+        pipeline = get_cached_rag_pipeline(
+            file_hash=effective_hash,
+            _parsed_pdf=parsed_pdf,
+            api_key=effective_api_key,
+            doc_id=effective_doc_id,
+        )
         st.session_state.rag_pipeline = pipeline
         return pipeline
     return None
@@ -853,7 +885,9 @@ def render_qa_chat(api_key: Optional[str], model_name: str) -> None:
 
     # Get or lazily initialize the RAG pipeline from the cached parsed_pdf
     parsed_pdf = st.session_state.get("parsed_pdf")
-    pipeline = get_or_create_rag_pipeline(parsed_pdf)
+    file_hash = st.session_state.get("uploaded_file_hash")
+    doc_filename = st.session_state.get("uploaded_filename")
+    pipeline = get_or_create_rag_pipeline(parsed_pdf, api_key=api_key, file_hash=file_hash, doc_id=doc_filename)
 
     # Status / Info and clear conversation
     col_info, col_clear = st.columns([4, 1])
@@ -877,33 +911,61 @@ def render_qa_chat(api_key: Optional[str], model_name: str) -> None:
     for msg in st.session_state.qa_messages:
         with st.chat_message(msg["role"]):
             st.markdown(msg["content"])
+
+            if msg.get("has_insufficient_evidence"):
+                st.info("ℹ️ The uploaded report does not contain enough information to fully answer this question.")
+
+            # Display cited pages badges
+            cited = msg.get("cited_pages")
+            if cited:
+                citations_str = " ".join([f"<span class='source-tag'>Page {p}</span>" for p in cited])
+                st.markdown(f"<div style='margin-bottom: 8px;'><small><b>Sources:</b> {citations_str}</small></div>", unsafe_allow_html=True)
+
             # Display source citations expander if available
             sources = msg.get("sources")
             if sources:
                 with st.expander(f"📄 Retrieved Sources ({len(sources)} passages)", expanded=False):
                     for idx, src in enumerate(sources):
-                        st.markdown(f"**[Page {src['page_number']}]** (Score: `{src['score']:.2f}`):")
+                        st.markdown(f"**[Page {src['page_number']}]** (Score: `{src['score']:.4f}`):")
                         st.markdown(f"> *{src['text']}*")
                         if idx < len(sources) - 1:
                             st.markdown("---")
 
+    # Suggested prompt pills for convenience
+    suggested_cols = st.columns(4)
+    suggested_questions = [
+        "What was the total revenue?",
+        "What are the principal risk factors?",
+        "What was operating cash flow?",
+        "What was the capital expenditure?",
+    ]
+    query_from_suggestion = None
+    for idx, (col, q_text) in enumerate(zip(suggested_cols, suggested_questions)):
+        with col:
+            if st.button(f"💡 {q_text}", key=f"sug_q_{idx}", use_container_width=True):
+                query_from_suggestion = q_text
+
     # Chat input
     user_query = st.chat_input("Ask a question about this report (e.g., 'What are the principal risk factors?')...")
-    if user_query:
+    effective_query = user_query or query_from_suggestion
+
+    if effective_query:
         if not api_key:
             st.error("⚠️ Gemini API key is required to answer questions. Please provide it in the sidebar.")
             return
 
         # Record user question
-        st.session_state.qa_messages.append({"role": "user", "content": user_query})
+        st.session_state.qa_messages.append({"role": "user", "content": effective_query})
 
         with st.spinner("Searching report passages and generating grounded answer..."):
+            fallback_model = getattr(config, "GEMINI_FALLBACK_MODEL", "gemini-3.5-flash-lite")
             qa_engine = ReportQAEngine(
                 api_key=api_key,
                 model_name=model_name,
+                fallback_model_name=fallback_model,
                 top_k=5,
             )
-            qa_result = qa_engine.answer_question(user_query, pipeline)
+            qa_result = qa_engine.answer_question(effective_query, pipeline)
 
             # Format source summaries
             source_summaries = [
@@ -921,6 +983,7 @@ def render_qa_chat(api_key: Optional[str], model_name: str) -> None:
                 "sources": source_summaries,
                 "cited_pages": qa_result.cited_pages,
                 "has_insufficient_evidence": qa_result.has_insufficient_evidence,
+                "model_used": qa_result.model_used,
             })
 
         st.rerun()

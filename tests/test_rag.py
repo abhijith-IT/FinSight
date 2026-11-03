@@ -5,10 +5,13 @@ from typing import List
 
 from ingestion.pdf_parser import ParsedPage, ParsedPDF
 from rag.chunker import DocumentChunker
-from rag.pipeline import RAGPipeline
+from rag.pipeline import RAGPipeline, create_rag_pipeline
 from rag.retriever import (
     BaseRetriever,
     BM25Retriever,
+    EmbeddingCache,
+    GeminiEmbeddingGenerator,
+    HybridRetriever,
     VectorRetriever,
     jaccard_similarity,
     tokenize,
@@ -362,6 +365,187 @@ class TestRAGPipelineEndToEnd(unittest.TestCase):
         pipeline.clear()
         self.assertEqual(pipeline.chunk_count, 0)
         self.assertEqual(pipeline.search("revenue"), [])
+
+
+class TestEmbeddingCacheAndGenerator(unittest.TestCase):
+    """Test suite for EmbeddingCache and GeminiEmbeddingGenerator."""
+
+    def test_embedding_cache_operations(self) -> None:
+        """Verify cache get, set, contains, and clear operations."""
+        cache = EmbeddingCache()
+        self.assertEqual(cache.size, 0)
+        self.assertFalse(cache.contains("test sentence"))
+        self.assertIsNone(cache.get("test sentence"))
+
+        vec = [0.1, 0.2, 0.3]
+        cache.set("test sentence", vec)
+        self.assertEqual(cache.size, 1)
+        self.assertTrue(cache.contains("test sentence"))
+        self.assertEqual(cache.get("test sentence"), vec)
+
+        # Whitespace normalization
+        self.assertEqual(cache.get("  test sentence  "), vec)
+
+        cache.clear()
+        self.assertEqual(cache.size, 0)
+        self.assertFalse(cache.contains("test sentence"))
+
+    def test_gemini_embedding_generator_caching_avoids_repeated_calls(self) -> None:
+        """Verify GeminiEmbeddingGenerator reuses cached embeddings and avoids duplicate API calls."""
+        from unittest.mock import MagicMock
+        mock_client = MagicMock()
+        mock_emb = MagicMock()
+        mock_emb.values = [0.5, 0.5, 0.0]
+        mock_resp = MagicMock()
+        mock_resp.embeddings = [mock_emb]
+        mock_client.models.embed_content.return_value = mock_resp
+
+        cache = EmbeddingCache()
+        generator = GeminiEmbeddingGenerator(
+            api_key="mock_key",
+            client=mock_client,
+            cache=cache,
+            base_delay_seconds=0.01,
+        )
+
+        # First call: misses cache, calls API
+        vecs1 = generator.embed_texts(["What was revenue?"])
+        self.assertEqual(len(vecs1), 1)
+        self.assertEqual(vecs1[0], [0.5, 0.5, 0.0])
+        self.assertEqual(mock_client.models.embed_content.call_count, 1)
+
+        # Second call with same text: hits cache, NO API call
+        vecs2 = generator.embed_texts(["What was revenue?"])
+        self.assertEqual(vecs2[0], [0.5, 0.5, 0.0])
+        self.assertEqual(mock_client.models.embed_content.call_count, 1)
+
+    def test_gemini_embedding_generator_transient_retry(self) -> None:
+        """Verify generator retries on transient 503 error before succeeding."""
+        from unittest.mock import MagicMock
+        mock_client = MagicMock()
+        mock_emb = MagicMock()
+        mock_emb.values = [1.0, 0.0]
+        mock_resp = MagicMock()
+        mock_resp.embeddings = [mock_emb]
+
+        # Fail once with 503, succeed on second attempt
+        mock_client.models.embed_content.side_effect = [
+            Exception("503 Service Unavailable"),
+            mock_resp,
+        ]
+
+        generator = GeminiEmbeddingGenerator(
+            api_key="mock_key",
+            client=mock_client,
+            cache=EmbeddingCache(),
+            base_delay_seconds=0.01,
+        )
+
+        vecs = generator.embed_texts(["sample text"])
+        self.assertEqual(len(vecs), 1)
+        self.assertEqual(vecs[0], [1.0, 0.0])
+        self.assertEqual(mock_client.models.embed_content.call_count, 2)
+
+
+class TestVectorRetrieverAdvanced(unittest.TestCase):
+    """Test suite for VectorRetriever deduplication and thresholds."""
+
+    def test_vector_space_deduplication(self) -> None:
+        """Verify vector retriever deduplicates near-identical vectors."""
+        # Two identical vectors and one distinct vector
+        def mock_embed(texts: List[str]) -> List[List[float]]:
+            vecs = []
+            for t in texts:
+                if "revenue" in t.lower():
+                    vecs.append([1.0, 0.0])  # Near identical
+                else:
+                    vecs.append([0.0, 1.0])  # Orthogonal
+            return vecs
+
+        vec_retriever = VectorRetriever(embed_fn=mock_embed, dedup_threshold=0.85)
+        chunks = [
+            DocumentChunk(chunk_id="c1", page_number=1, text="Total revenue was $100M.", char_count=24),
+            DocumentChunk(chunk_id="c2", page_number=1, text="Consolidated revenue was $100M.", char_count=32),
+            DocumentChunk(chunk_id="c3", page_number=2, text="Operating expenses rose.", char_count=23),
+        ]
+        vec_retriever.index(chunks)
+
+        # Searching for revenue should only return 1 of the 2 duplicate revenue chunks
+        results = vec_retriever.retrieve("revenue", top_k=3)
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0].chunk_id, "c1")
+
+
+class TestHybridRetriever(unittest.TestCase):
+    """Test suite for HybridRetriever (BM25 + Semantic RRF)."""
+
+    def test_hybrid_retriever_combines_and_ranks(self) -> None:
+        """Verify HybridRetriever fuses keyword and semantic results via RRF."""
+        bm25 = BM25Retriever()
+        def mock_embed(texts: List[str]) -> List[List[float]]:
+            vecs = []
+            for t in texts:
+                vecs.append([1.0, 0.0] if "threat" in t.lower() or "risk" in t.lower() else [0.0, 1.0])
+            return vecs
+
+        vec = VectorRetriever(embed_fn=mock_embed)
+        hybrid = HybridRetriever(bm25_retriever=bm25, vector_retriever=vec)
+
+        chunks = [
+            DocumentChunk(chunk_id="c1", page_number=1, text="Net profit reached record highs.", char_count=32),
+            DocumentChunk(chunk_id="c2", page_number=3, text="Major risk factors and threat disclosures.", char_count=42),
+        ]
+        hybrid.index(chunks)
+        self.assertEqual(hybrid.chunk_count, 2)
+
+        results = hybrid.retrieve("threat disclosures", top_k=1)
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0].chunk_id, "c2")
+        self.assertGreater(results[0].score, 0.0)
+
+    def test_hybrid_fallback_to_bm25_when_vector_fails(self) -> None:
+        """Verify HybridRetriever falls back cleanly to BM25 if Vector retrieval raises error."""
+        bm25 = BM25Retriever()
+        def failing_embed(texts: List[str]) -> List[List[float]]:
+            raise RuntimeError("API quota exhausted")
+
+        failing_vec = VectorRetriever(embed_fn=failing_embed)
+        hybrid = HybridRetriever(bm25_retriever=bm25, vector_retriever=failing_vec)
+
+        chunks = [
+            DocumentChunk(chunk_id="c1", page_number=1, text="Total revenue was $500M.", char_count=23),
+        ]
+        bm25.index(chunks)
+        hybrid._chunks = chunks
+
+        results = hybrid.retrieve("revenue", top_k=1)
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0].chunk_id, "c1")
+
+
+class TestRAGPipelineDocumentCaching(unittest.TestCase):
+    """Test suite for RAGPipeline caching and factory function."""
+
+    def test_pipeline_skips_reindexing_identical_document(self) -> None:
+        """Verify pipeline.ingest reuses existing chunks when given identical ParsedPDF."""
+        p1 = ParsedPage(page_number=1, text="Financial highlights overview.", has_text=True, char_count=30)
+        pdf = ParsedPDF(file_name="doc.pdf", total_pages=1, pages=[p1], total_characters=30)
+
+        pipeline = RAGPipeline()
+        chunks1 = pipeline.ingest(pdf, doc_id="report")
+        self.assertEqual(len(chunks1), 1)
+
+        # Second ingest with same pdf
+        chunks2 = pipeline.ingest(pdf, doc_id="report")
+        self.assertEqual(chunks1, chunks2)
+
+    def test_create_rag_pipeline_factory(self) -> None:
+        """Verify create_rag_pipeline initializes appropriate retriever based on config."""
+        pipe_bm25 = create_rag_pipeline(api_key=None, retriever_type="bm25")
+        self.assertIsInstance(pipe_bm25.retriever, BM25Retriever)
+
+        pipe_hybrid = create_rag_pipeline(api_key="mock_key", retriever_type="hybrid")
+        self.assertIsInstance(pipe_hybrid.retriever, HybridRetriever)
 
 
 if __name__ == "__main__":
