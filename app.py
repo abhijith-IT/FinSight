@@ -207,7 +207,8 @@ def render_sidebar() -> Tuple[Optional[str], Optional[str]]:
 
         st.subheader("🔑 API Configuration")
         default_api_key = getattr(config, "GEMINI_API_KEY", "") or ""
-        configured_model = getattr(config, "GEMINI_MODEL", "gemini-3.1-flash-lite")
+        configured_model = getattr(config, "GEMINI_MODEL", "gemini-3.8-flash")
+        configured_fallback = getattr(config, "GEMINI_FALLBACK_MODEL", "gemini-3.5-flash-lite")
 
         api_key_input = st.text_input(
             "Gemini API Key",
@@ -218,8 +219,8 @@ def render_sidebar() -> Tuple[Optional[str], Optional[str]]:
 
         model_input = st.selectbox(
             "Gemini Model",
-            options=["gemini-3.1-flash-lite", "gemini-2.5-flash", "gemini-2.5-pro"],
-            index=0 if configured_model == "gemini-3.1-flash-lite" else 1,
+            options=["gemini-3.8-flash", "gemini-3.5-flash-lite", "gemini-2.5-flash", "gemini-2.5-pro"],
+            index=0 if configured_model == "gemini-3.8-flash" else 1,
         )
 
         st.markdown("---")
@@ -251,6 +252,55 @@ def render_sidebar() -> Tuple[Optional[str], Optional[str]]:
     return api_key_input, model_input
 
 
+@st.cache_data(show_spinner=False)
+def get_cached_parsed_pdf(file_bytes: bytes, filename: str) -> ParsedPDF:
+    """Parse PDF bytes once and cache the ParsedPDF object across runs."""
+    pdf_stream = io.BytesIO(file_bytes)
+    setattr(pdf_stream, "name", filename)
+    return extract_text_from_pdf(pdf_stream)
+
+
+@st.cache_data(show_spinner=False)
+def get_cached_extraction_report(
+    file_hash: str,
+    api_key: Optional[str],
+    model_name: str,
+    _parsed_pdf: ParsedPDF,
+    fallback_model_name: Optional[str] = None,
+) -> FinancialExtractionReport:
+    """Extract financial statements with Gemini and cache result by document hash and model."""
+    effective_fallback = (
+        fallback_model_name
+        if fallback_model_name is not None
+        else getattr(config, "GEMINI_FALLBACK_MODEL", "gemini-3.5-flash-lite")
+    )
+    extractor = FinancialExtractor(
+        api_key=api_key,
+        model_name=model_name,
+        fallback_model_name=effective_fallback,
+        max_pages_per_section=4,
+    )
+    return extractor.extract(_parsed_pdf)
+
+
+@st.cache_data(show_spinner=False)
+def get_cached_executive_summary(
+    file_hash: str,
+    api_key: Optional[str],
+    model_name: str,
+    _report: FinancialExtractionReport,
+    _ratios: List[FinancialRatios],
+    _pipeline: Optional[RAGPipeline],
+) -> ExecutiveSummary:
+    """Generate AI executive summary and cache result by document hash and model."""
+    summary_gen = ExecutiveSummaryGenerator(api_key=api_key, model_name=model_name)
+    return summary_gen.generate_summary(
+        report=_report,
+        ratios=_ratios,
+        pipeline=_pipeline,
+    )
+
+
 def run_pipeline(
     uploaded_file: Any,
     api_key: Optional[str],
@@ -271,12 +321,10 @@ def run_pipeline(
     filename = getattr(uploaded_file, "name", "document.pdf")
 
     with st.status("Analyzing Financial Report...", expanded=True) as status:
-        # Step 1: PDF Ingestion & Text Parsing
+        # Step 1: PDF Ingestion & Text Parsing (Cached)
         status.update(label="1/5: Parsing PDF pages with pdfplumber...")
         try:
-            pdf_stream = io.BytesIO(file_bytes)
-            setattr(pdf_stream, "name", filename)
-            parsed_pdf = extract_text_from_pdf(pdf_stream)
+            parsed_pdf = get_cached_parsed_pdf(file_bytes, filename)
         except EmptyPDFError as e:
             st.error(f"Cannot process PDF: {e}")
             status.update(label="Extraction failed: Empty PDF", state="error")
@@ -293,15 +341,15 @@ def run_pipeline(
             clear_report_state()
             return False
 
-        # Step 2: Gemini Structured Statement Extraction
+        # Step 2: Gemini Structured Statement Extraction (Cached)
         status.update(label="2/5: Extracting structured financial statements with Gemini...")
         try:
-            extractor = FinancialExtractor(
+            extraction_report = get_cached_extraction_report(
+                file_hash=file_hash,
                 api_key=api_key,
                 model_name=model_name,
-                max_pages_per_section=4,
+                _parsed_pdf=parsed_pdf,
             )
-            extraction_report = extractor.extract(parsed_pdf)
         except ExtractionError as e:
             st.error(f"Financial extraction error: {e}")
             status.update(label="Extraction failed: LLM Error", state="error")
@@ -332,15 +380,17 @@ def run_pipeline(
         except Exception as e:
             st.warning(f"Note: RAG indexing encountered an issue: {e}")
 
-        # Step 5: Generate AI Executive Summary
+        # Step 5: Generate AI Executive Summary (Cached)
         status.update(label="5/5: Generating AI Executive Summary...")
         exec_summary: Optional[ExecutiveSummary] = None
         try:
-            summary_gen = ExecutiveSummaryGenerator(api_key=api_key, model_name=model_name)
-            exec_summary = summary_gen.generate_summary(
-                report=extraction_report,
-                ratios=ratios_list,
-                pipeline=rag_pipeline,
+            exec_summary = get_cached_executive_summary(
+                file_hash=file_hash,
+                api_key=api_key,
+                model_name=model_name,
+                _report=extraction_report,
+                _ratios=ratios_list,
+                _pipeline=rag_pipeline,
             )
         except Exception as e:
             st.warning(f"Note: AI Executive Summary generation encountered an issue ({e}). You can generate it from the dashboard.")
@@ -355,7 +405,14 @@ def run_pipeline(
         st.session_state.qa_messages = []
         st.session_state.executive_summary = exec_summary
 
-        status.update(label="Analysis complete!", state="complete", expanded=False)
+        if getattr(extraction_report, "is_incomplete", False):
+            status.update(
+                label="Analysis incomplete: Model temporarily unavailable (partial data preserved)",
+                state="error",
+                expanded=True,
+            )
+        else:
+            status.update(label="Analysis complete!", state="complete", expanded=False)
 
     return True
 
@@ -1013,14 +1070,57 @@ def main() -> None:
         ratios: List[FinancialRatios] = st.session_state.get("ratios", [])
 
         if not report.annual_reports:
-            st.warning(
-                "No structured financial statements could be extracted from this document. "
-                "The report might be an image-only scan or does not contain standard financial statement tables."
-            )
+            if getattr(report, "is_incomplete", False):
+                st.warning(
+                    "⚠️ **Extraction Incomplete:** The Gemini model is temporarily unavailable (503 / 429). "
+                    "No financial statements could be extracted before pausing. Please retry below."
+                )
+                if st.button("🔄 Retry Extraction", type="primary"):
+                    get_cached_extraction_report.clear()
+                    success = run_pipeline(
+                        uploaded_file=uploaded_file,
+                        api_key=api_key,
+                        model_name=model_name,
+                        file_bytes=file_bytes,
+                        file_hash=file_hash,
+                    )
+                    st.rerun()
+            else:
+                st.warning(
+                    "No structured financial statements could be extracted from this document. "
+                    "The report might be an image-only scan or does not contain standard financial statement tables."
+                )
             render_audit_and_validation(report)
             return
 
         st.markdown("---")
+
+        # Incomplete extraction warning banner and recovery action
+        if getattr(report, "is_incomplete", False):
+            failed_info = []
+            if getattr(report, "failed_sections", None):
+                failed_info.append(f"Failed sections: {report.failed_sections}")
+            if getattr(report, "unprocessed_sections", None):
+                failed_info.append(f"Skipped sections: {report.unprocessed_sections}")
+            detail_str = f" ({'; '.join(failed_info)})" if failed_info else ""
+
+            st.warning(
+                f"⚠️ **Partial Extraction Notice:** High demand or transient availability errors (503 / 429) "
+                f"interrupted extraction{detail_str}. Successfully extracted figures are displayed below. "
+                "You can retry to complete extraction without repeating already successful sections."
+            )
+            col_retry, _ = st.columns([1, 3])
+            with col_retry:
+                if st.button("🔄 Retry Failed / Incomplete Sections", type="primary", use_container_width=True):
+                    get_cached_extraction_report.clear()
+                    success = run_pipeline(
+                        uploaded_file=uploaded_file,
+                        api_key=api_key,
+                        model_name=model_name,
+                        file_bytes=file_bytes,
+                        file_hash=file_hash,
+                    )
+                    st.rerun()
 
         # Top-level entity banner
         comp_name = report.company_name or "Financial Report Analysis"

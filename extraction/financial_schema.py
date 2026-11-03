@@ -40,11 +40,21 @@ class IncomeStatement(BaseModel):
     )
     operating_expenses: Optional[FinancialValue] = Field(
         default_factory=FinancialValue,
-        description="Total operating expenses (OPEX).",
+        description=(
+            "Total operating expenses (OPEX) as explicitly labelled in the statement. "
+            "ONLY populate if the source has a line explicitly called 'Total operating expenses', "
+            "'Operating expenses', or a clear aggregate OPEX total. "
+            "DO NOT use 'Other expenses' (a residual catch-all in Indian P&L formats) as a substitute."
+        ),
     )
     operating_profit: Optional[FinancialValue] = Field(
         default_factory=FinancialValue,
-        description="Operating income, operating profit, or EBIT.",
+        description=(
+            "Operating profit as explicitly reported: 'Operating profit', 'Profit from operations', "
+            "'Operating income', or 'EBIT' on the face of the statement. "
+            "DO NOT substitute EBITDA for operating profit — EBITDA ≠ EBIT. "
+            "Leave null if only EBITDA is shown but not an explicit operating profit / EBIT line."
+        ),
     )
     net_profit: Optional[FinancialValue] = Field(
         default_factory=FinancialValue,
@@ -81,11 +91,21 @@ class BalanceSheet(BaseModel):
     )
     total_debt: Optional[FinancialValue] = Field(
         default_factory=FinancialValue,
-        description="Total debt (short-term borrowings + long-term debt). Distinct from total liabilities.",
+        description=(
+            "Gross total borrowings: short-term borrowings + long-term borrowings as reported under liabilities. "
+            "This is GROSS debt, NOT net debt (borrowings minus cash). "
+            "NEVER substitute total_liabilities for total_debt. "
+            "Only populate if explicitly reported as 'Total borrowings', 'Total debt', or identifiable from borrowings sub-totals."
+        ),
     )
     equity: Optional[FinancialValue] = Field(
         default_factory=FinancialValue,
-        description="Total shareholders' equity, stockholders' equity, or net worth.",
+        description=(
+            "Shareholders' equity or net worth. "
+            "For CONSOLIDATED statements: prefer 'Equity attributable to owners of the parent' "
+            "(excluding Non-Controlling Interest) if reported separately. "
+            "If only total equity is reported, use that."
+        ),
     )
 
     @field_validator(
@@ -183,4 +203,16 @@ class FinancialExtractionReport(BaseModel):
     extraction_notes: List[str] = Field(
         default_factory=list,
         description="Audit notes, section metadata, or extraction warnings.",
+    )
+    is_incomplete: bool = Field(
+        default=False,
+        description="Flag set to True if extraction stopped with failed or unprocessed sections.",
+    )
+    failed_sections: List[int] = Field(
+        default_factory=list,
+        description="List of 1-indexed section numbers that failed extraction.",
+    )
+    unprocessed_sections: List[int] = Field(
+        default_factory=list,
+        description="List of 1-indexed section numbers that were paused/unprocessed due to model availability.",
     )

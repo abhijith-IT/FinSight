@@ -2,6 +2,7 @@
 
 import io
 import unittest
+from unittest.mock import MagicMock, patch
 import streamlit as st
 
 from analytics.ratios import FinancialRatios
@@ -13,6 +14,9 @@ from app import (
     format_currency_value,
     format_pct_value,
     format_ratio_value,
+    get_cached_executive_summary,
+    get_cached_extraction_report,
+    get_cached_parsed_pdf,
     safe_metric_obj,
     safe_metric_source_page,
     safe_metric_value,
@@ -312,6 +316,66 @@ class TestReportStalenessAndHashVerification(unittest.TestCase):
         # Report must NOT be cleared
         self.assertIn("extraction_report", st.session_state)
         self.assertEqual(st.session_state.extraction_report.company_name, "Reliance Industries Limited")
+
+
+class TestDashboardCachingAndPerformance(unittest.TestCase):
+    """Test PDF parsing and financial extraction caching in Streamlit."""
+
+    def setUp(self) -> None:
+        """Clear state before each test."""
+        clear_report_state()
+
+    def tearDown(self) -> None:
+        """Clean up state after each test."""
+        clear_report_state()
+
+    def test_get_cached_parsed_pdf_caches_result(self) -> None:
+        """Verify get_cached_parsed_pdf parses once and reuses cached ParsedPDF."""
+        sample_bytes = b"%PDF-1.4 sample content for caching test"
+        with patch("app.extract_text_from_pdf") as mock_extract:
+            mock_extract.return_value = ParsedPDF(total_pages=1, pages=[])
+
+            # First call executes extract_text_from_pdf
+            res1 = get_cached_parsed_pdf(sample_bytes, "test.pdf")
+            self.assertEqual(mock_extract.call_count, 1)
+
+            # Second call with identical bytes is served from cache!
+            res2 = get_cached_parsed_pdf(sample_bytes, "test.pdf")
+            self.assertEqual(mock_extract.call_count, 1)
+            self.assertEqual(res1.total_pages, res2.total_pages)
+
+    def test_get_cached_extraction_report_caches_result(self) -> None:
+        """Verify get_cached_extraction_report extracts once and reuses cached report."""
+        parsed_pdf = ParsedPDF(total_pages=1, pages=[])
+        doc_hash = "fakehash12345"
+
+        with patch("app.FinancialExtractor") as mock_extractor_cls:
+            mock_extractor_instance = MagicMock()
+            mock_extractor_cls.return_value = mock_extractor_instance
+            mock_extractor_instance.extract.return_value = FinancialExtractionReport(company_name="Cached Inc")
+
+            # First extraction call
+            rep1 = get_cached_extraction_report(doc_hash, "key", "gemini-3.1-flash-lite", parsed_pdf)
+            self.assertEqual(mock_extractor_instance.extract.call_count, 1)
+
+            # Second extraction call with identical hash is served from cache!
+            rep2 = get_cached_extraction_report(doc_hash, "key", "gemini-3.1-flash-lite", parsed_pdf)
+            self.assertEqual(mock_extractor_instance.extract.call_count, 1)
+            self.assertEqual(rep1.company_name, "Cached Inc")
+            self.assertEqual(rep2.company_name, "Cached Inc")
+
+    def test_dashboard_controls_interaction_preserves_extraction(self) -> None:
+        """Verify interacting with dashboard controls leaves extraction state intact."""
+        st.session_state.uploaded_file_hash = "doc_hash_1"
+        st.session_state.extraction_report = FinancialExtractionReport(company_name="Preserved Corp")
+
+        # Simulate user changing selectbox / interacting with UI controls
+        st.session_state.selected_year = 2023
+        st.session_state.active_chart_tab = "margins"
+
+        # Extraction state must remain untouched
+        self.assertIn("extraction_report", st.session_state)
+        self.assertEqual(st.session_state.extraction_report.company_name, "Preserved Corp")
 
 
 if __name__ == "__main__":

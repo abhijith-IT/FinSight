@@ -1,9 +1,9 @@
+
 # FinSight - Financial Statement Intelligence
 
 FinSight is an AI-powered financial intelligence dashboard that extracts multi-year corporate financial statements from annual report PDFs (or 10-K filings), computes verified financial ratios, provides interactive trend visualizations, enables report-grounded Q&A with source page citations, and generates executive briefing summaries.
 
 ---
-
 ## Key Features
 
 1. **Structured PDF Ingestion & Parsing**

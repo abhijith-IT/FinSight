@@ -76,7 +76,7 @@ class ReportQAEngine:
             min_score: Minimum relevance score threshold for retrieval.
         """
         self.api_key = api_key or getattr(config, "GEMINI_API_KEY", None)
-        self.model_name = model_name or getattr(config, "GEMINI_MODEL", "gemini-3.1-flash-lite")
+        self.model_name = model_name or getattr(config, "GEMINI_MODEL", "gemini-3.8-flash")
         self._client = client
         self.top_k = top_k
         self.min_score = min_score

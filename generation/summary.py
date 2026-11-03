@@ -92,7 +92,7 @@ class ExecutiveSummaryGenerator:
             client: Optional pre-configured genai.Client instance (useful for testing).
         """
         self.api_key = api_key or getattr(config, "GEMINI_API_KEY", None)
-        self.model_name = model_name or getattr(config, "GEMINI_MODEL", "gemini-3.1-flash-lite")
+        self.model_name = model_name or getattr(config, "GEMINI_MODEL", "gemini-3.8-flash")
         self._client = client
 
     @property
