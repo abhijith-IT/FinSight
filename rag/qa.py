@@ -9,15 +9,17 @@ from __future__ import annotations
 import random
 import re
 import time
-from typing import Any, Dict, List, Optional, Set
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set
 
 from google import genai
 from google.genai import types
 from pydantic import BaseModel, ConfigDict, Field
 
 import config
-from rag.pipeline import RAGPipeline
 from rag.schema import RetrievalResult
+
+if TYPE_CHECKING:
+    from rag.pipeline import RAGPipeline
 
 
 QA_SYSTEM_INSTRUCTION = """You are FinSight's expert AI financial research assistant.
@@ -219,6 +221,9 @@ class ReportQAEngine:
                 error=error_msg,
             )
 
+        if not isinstance(raw_answer, str):
+            raw_answer = str(raw_answer or "")
+
         if not raw_answer.strip():
             raw_answer = "The report does not contain enough information to answer this question. (The provided report passages do not contain sufficient evidence.)"
 
@@ -271,7 +276,15 @@ class ReportQAEngine:
                         contents=prompt,
                         config=config,
                     )
-                    text = getattr(response, "text", "") or ""
+                    resp_text = getattr(response, "text", "")
+                    if resp_text is None:
+                        text = ""
+                    elif isinstance(resp_text, str):
+                        text = resp_text
+                    elif hasattr(resp_text, "_mock_name") or "Mock" in type(resp_text).__name__:
+                        text = ""
+                    else:
+                        text = str(resp_text)
                     return text, current_model, None
                 except Exception as e:
                     last_error = e

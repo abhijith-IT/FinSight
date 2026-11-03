@@ -34,8 +34,12 @@ from ingestion.pdf_parser import (
     ParsedPDF,
     extract_text_from_pdf,
 )
+from generation.export import generate_consolidated_csv, generate_executive_pdf
 from generation.summary import ExecutiveSummary, ExecutiveSummaryGenerator
-from rag.pipeline import RAGPipeline, create_rag_pipeline
+try:
+    from rag.pipeline import RAGPipeline, create_rag_pipeline
+except ImportError:
+    from rag import RAGPipeline, create_rag_pipeline
 from rag.qa import QAResult, ReportQAEngine
 
 # Set page configuration
@@ -168,6 +172,8 @@ def safe_metric_value(statement: Any, field_name: str) -> Optional[float]:
     metric = getattr(statement, field_name, None)
     if metric is None:
         return None
+    if getattr(metric, "is_unavailable", False):
+        return None
     if isinstance(metric, (int, float)):
         return float(metric)
     return getattr(metric, "value", None)
@@ -179,6 +185,8 @@ def safe_metric_source_page(statement: Any, field_name: str) -> Optional[int]:
         return None
     metric = getattr(statement, field_name, None)
     if metric is None:
+        return None
+    if getattr(metric, "is_unavailable", False):
         return None
     return getattr(metric, "source_page", None)
 
@@ -293,7 +301,12 @@ def get_cached_executive_summary(
     _pipeline: Optional[RAGPipeline],
 ) -> ExecutiveSummary:
     """Generate AI executive summary and cache result by document hash and model."""
-    summary_gen = ExecutiveSummaryGenerator(api_key=api_key, model_name=model_name)
+    fallback_model = getattr(config, "GEMINI_FALLBACK_MODEL", "gemini-3.5-flash-lite")
+    summary_gen = ExecutiveSummaryGenerator(
+        api_key=api_key,
+        model_name=model_name,
+        fallback_model_name=fallback_model,
+    )
     return summary_gen.generate_summary(
         report=_report,
         ratios=_ratios,
@@ -381,6 +394,11 @@ def run_pipeline(
                 file_hash=file_hash,
                 doc_id=filename,
             )
+            if rag_pipeline and rag_pipeline.is_semantic_unavailable:
+                st.warning(
+                    f"⚠️ Note: Semantic embedding generation is temporarily unavailable ({rag_pipeline.embedding_error}). "
+                    "Document passages remain indexed using keyword retrieval (BM25)."
+                )
         except Exception as e:
             st.warning(f"Note: RAG indexing encountered an issue: {e}")
 
@@ -830,6 +848,22 @@ def render_financial_tables(
             ratio_table.append(row)
         st.dataframe(pd.DataFrame(ratio_table).set_index("Financial Ratio"), use_container_width=True)
 
+    # Dedicated CSV export action for financial statements and ratios
+    st.markdown("---")
+    report_obj = st.session_state.get("extraction_report")
+    if report_obj:
+        safe_entity = re.sub(r"[^a-zA-Z0-9_\-]", "_", (report_obj.company_name or "financial").strip().lower())
+        csv_payload = generate_consolidated_csv(report_obj, ratios_list)
+        st.download_button(
+            label="📥 Download Financial Data (CSV)",
+            data=csv_payload,
+            file_name=f"{safe_entity}_financial_data.csv",
+            mime="text/csv",
+            key="dl_financial_data_table_btn",
+            help="Download complete statements and ratios as a consolidated CSV spreadsheet.",
+            use_container_width=True,
+        )
+
 
 @st.cache_resource(show_spinner=False)
 def get_cached_rag_pipeline(
@@ -893,13 +927,20 @@ def render_qa_chat(api_key: Optional[str], model_name: str) -> None:
     col_info, col_clear = st.columns([4, 1])
     with col_info:
         if pipeline and pipeline.chunk_count > 0:
+            sem_tag = " (Semantic + Keyword Hybrid)" if not pipeline.is_semantic_unavailable else " (Keyword BM25 Only)"
             st.markdown(
-                f"<small style='color: #64748B;'>Indexed <b>{pipeline.chunk_count}</b> passages across <b>{len(pipeline.indexed_pages)}</b> pages ready for Q&A.</small>",
+                f"<small style='color: #64748B;'>Indexed <b>{pipeline.chunk_count}</b> passages across <b>{len(pipeline.indexed_pages)}</b> pages ready for Q&A{sem_tag}.</small>",
                 unsafe_allow_html=True,
             )
         else:
             st.info("No report text is currently indexed for Q&A.")
             return
+
+    if pipeline and pipeline.is_semantic_unavailable:
+        st.warning(
+            "⚠️ **Semantic Retrieval Notice:** Gemini embedding generation is temporarily unavailable (service error or quota limit). "
+            "Keyword retrieval (BM25) is actively being used for document Q&A."
+        )
 
     with col_clear:
         if st.session_state.qa_messages:
@@ -1017,14 +1058,30 @@ def render_executive_summary_section(
                 st.error("⚠️ Gemini API key is required to generate the executive summary. Please configure it in the sidebar.")
                 return
             with st.spinner("Analyzing multi-year performance and synthesizing executive briefing..."):
-                pipeline = get_or_create_rag_pipeline(st.session_state.get("parsed_pdf"))
-                generator = ExecutiveSummaryGenerator(api_key=api_key, model_name=model_name)
+                get_cached_executive_summary.clear()
+                pipeline = get_or_create_rag_pipeline(
+                    st.session_state.get("parsed_pdf"),
+                    api_key=api_key,
+                    file_hash=st.session_state.get("uploaded_file_hash"),
+                    doc_id=st.session_state.get("uploaded_filename"),
+                )
+                fallback_model = getattr(config, "GEMINI_FALLBACK_MODEL", "gemini-3.5-flash-lite")
+                generator = ExecutiveSummaryGenerator(
+                    api_key=api_key,
+                    model_name=model_name,
+                    fallback_model_name=fallback_model,
+                )
                 st.session_state.executive_summary = generator.generate_summary(report, ratios, pipeline)
             st.rerun()
 
     # Display cached summary
     cached_summary = st.session_state.get("executive_summary")
     if cached_summary:
+        if getattr(cached_summary, "is_incomplete", False):
+            st.warning(
+                "⚠️ **Partial Briefing Notice:** This executive summary was synthesized from an incomplete financial "
+                "report extraction due to temporary model availability limits. Observations reflect only successfully extracted sections."
+            )
         if cached_summary.error:
             st.warning(f"Executive Summary Notice: {cached_summary.error}")
         with st.container(border=True):
@@ -1185,14 +1242,45 @@ def main() -> None:
                     )
                     st.rerun()
 
-        # Top-level entity banner
+        # Top-level entity banner and dedicated export buttons
         comp_name = report.company_name or "Financial Report Analysis"
         year_span = f"FY {report.annual_reports[0].year} – FY {report.annual_reports[-1].year}"
         curr = report.annual_reports[0].currency or ""
         unit = report.annual_reports[0].unit or ""
         scale_tag = f" | {curr} ({unit})" if curr or unit else ""
+        safe_entity_name = re.sub(r"[^a-zA-Z0-9_\-]", "_", comp_name.strip().lower())
 
-        st.markdown(f"### {comp_name} <small style='color: #64748B;'>({year_span}{scale_tag})</small>", unsafe_allow_html=True)
+        col_title, col_exp_csv, col_exp_pdf = st.columns([3, 1, 1])
+        with col_title:
+            st.markdown(f"### {comp_name} <small style='color: #64748B;'>({year_span}{scale_tag})</small>", unsafe_allow_html=True)
+
+        with col_exp_csv:
+            csv_data = generate_consolidated_csv(report, ratios)
+            st.download_button(
+                label="📥 Download Financial Data",
+                data=csv_data,
+                file_name=f"{safe_entity_name}_financial_data.csv",
+                mime="text/csv",
+                key="dl_financial_data_header_btn",
+                help="Download consolidated statements and calculated financial ratios as a CSV spreadsheet.",
+                use_container_width=True,
+            )
+
+        with col_exp_pdf:
+            pdf_data = generate_executive_pdf(
+                report=report,
+                ratios=ratios,
+                summary=st.session_state.get("executive_summary"),
+            )
+            st.download_button(
+                label="📄 Download Executive Report",
+                data=pdf_data,
+                file_name=f"{safe_entity_name}_executive_report.pdf",
+                mime="application/pdf",
+                key="dl_executive_pdf_header_btn",
+                help="Download publication-quality Executive Briefing and Statement Audit report (PDF).",
+                use_container_width=True,
+            )
 
         # AI Executive Summary Briefing
         render_executive_summary_section(report, ratios, api_key, model_name)

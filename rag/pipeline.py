@@ -23,6 +23,8 @@ from rag.retriever import (
 )
 from rag.schema import DocumentChunk, RetrievalResult
 
+__all__ = ["RAGPipeline", "create_rag_pipeline"]
+
 
 class RAGPipeline:
     """High-level pipeline coordinating document chunking and retrieval."""
@@ -115,6 +117,20 @@ class RAGPipeline:
     def indexed_pages(self) -> List[int]:
         """Sorted list of unique 1-indexed page numbers present in the index."""
         return sorted({c.page_number for c in self._chunks})
+
+    @property
+    def is_semantic_unavailable(self) -> bool:
+        """Check if dense vector retrieval is unavailable due to embedding failure."""
+        if isinstance(self.retriever, HybridRetriever):
+            return self.retriever.semantic_unavailable
+        return False
+
+    @property
+    def embedding_error(self) -> Optional[str]:
+        """Return the embedding error message if semantic retrieval is unavailable."""
+        if isinstance(self.retriever, HybridRetriever):
+            return self.retriever.embedding_error
+        return None
 
     def clear(self) -> None:
         """Reset chunk storage and clear the retriever index."""

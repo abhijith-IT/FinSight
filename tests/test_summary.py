@@ -108,6 +108,8 @@ class TestExecutiveSummaryGenerator(unittest.TestCase):
             api_key="mock_key",
             model_name="gemini-3.1-flash-lite",
             client=self.mock_client,
+            max_retries=1,
+            base_delay_seconds=0.01,
         )
 
     def test_generate_summary_success_with_citations(self) -> None:
@@ -225,6 +227,133 @@ class TestExecutiveSummaryGenerator(unittest.TestCase):
         self.assertEqual(summary.reporting_period, "FY 2023")
         self.assertIn("[Page 2]", summary.summary_text)
         self.assertIsNone(summary.error)
+
+    def test_generate_summary_distinguishes_zero_from_unavailable_metrics(self) -> None:
+        """Verify prompt and extraction distinguish 0.0 values from unavailable metrics."""
+        zero_report = FinancialExtractionReport(
+            company_name="Zero Metrics Corp",
+            annual_reports=[
+                AnnualFinancialData(
+                    year=2023,
+                    currency="USD",
+                    income_statement=IncomeStatement(
+                        revenue=FinancialValue(value=100.0, source_page=2),
+                        cost_of_goods_sold=FinancialValue(value=None, is_unavailable=True),
+                        operating_profit=FinancialValue(value=0.0, source_page=2),
+                        net_profit=FinancialValue(value=10.0, source_page=2),
+                    ),
+                    balance_sheet=BalanceSheet(
+                        total_assets=FinancialValue(value=200.0, source_page=3),
+                        total_debt=FinancialValue(value=0.0, source_page=3),
+                    ),
+                    source_pages=[2, 3],
+                )
+            ],
+        )
+        mock_response = MagicMock()
+        mock_response.text = (
+            "## 🏢 Executive Overview\nZero Metrics Corp reported $0.00 operating profit [Page 2]. "
+            "COGS was not reported while debt was zero [Page 3]."
+        )
+        self.mock_client.models.generate_content.return_value = mock_response
+
+        summary = self.generator.generate_summary(zero_report, [])
+
+        # Verify prompt passed to Gemini distinguishes 0.0 from Unavailable
+        call_kwargs = self.mock_client.models.generate_content.call_args[1]
+        prompt = call_kwargs["contents"]
+        self.assertIn("Operating Profit (EBIT): 0.0", prompt)
+        self.assertIn("Cost of Goods Sold (COGS): Unavailable (Not Reported)", prompt)
+        self.assertIn("Total Debt: 0.0", prompt)
+        self.assertIn("[Page 2]", summary.summary_text)
+
+    def test_generate_summary_incomplete_extraction_gracefully_communicated(self) -> None:
+        """Verify incomplete extraction flag is passed in prompt and set on ExecutiveSummary."""
+        incomplete_report = FinancialExtractionReport(
+            company_name="Incomplete Inc.",
+            annual_reports=[
+                AnnualFinancialData(
+                    year=2023,
+                    income_statement=IncomeStatement(
+                        revenue=FinancialValue(value=500.0, source_page=1),
+                        net_profit=FinancialValue(value=50.0, source_page=1),
+                    ),
+                    source_pages=[1],
+                )
+            ],
+            is_incomplete=True,
+            failed_sections=[2],
+            unprocessed_sections=[3],
+        )
+        mock_response = MagicMock()
+        mock_response.text = (
+            "## 🏢 Executive Overview\n"
+            "⚠️ Note: Extraction was incomplete due to model availability. "
+            "Incomplete Inc. reported $500 revenue based on available sections [Page 1]."
+        )
+        self.mock_client.models.generate_content.return_value = mock_response
+
+        summary = self.generator.generate_summary(incomplete_report, [])
+
+        self.assertTrue(summary.is_incomplete)
+        call_kwargs = self.mock_client.models.generate_content.call_args[1]
+        prompt = call_kwargs["contents"]
+        self.assertIn("IMPORTANT LIMITATION NOTICE", prompt)
+
+    def test_generate_summary_transient_retry_and_model_fallback(self) -> None:
+        """Verify generator retries transient 503 and switches to fallback model."""
+        mock_response = MagicMock()
+        mock_response.text = (
+            "## 🏢 Executive Overview\n"
+            "Apex Global Technologies summary generated via fallback model [Page 3]."
+        )
+
+        def mock_generate(model, contents, config):
+            if model == "gemini-3.8-flash":
+                raise Exception("503 Service Unavailable: High demand")
+            return mock_response
+
+        self.mock_client.models.generate_content.side_effect = mock_generate
+
+        resilient_gen = ExecutiveSummaryGenerator(
+            api_key="mock_key",
+            model_name="gemini-3.8-flash",
+            fallback_model_name="gemini-3.5-flash-lite",
+            client=self.mock_client,
+            max_retries=1,
+            base_delay_seconds=0.01,
+        )
+
+        summary = resilient_gen.generate_summary(self.report, self.ratios, self.pipeline)
+
+        self.assertIsNone(summary.error)
+        self.assertEqual(summary.model_used, "gemini-3.5-flash-lite")
+        self.assertIn("fallback model", summary.summary_text)
+
+    def test_generate_summary_caching_avoids_duplicate_api_calls(self) -> None:
+        """Verify identical report and ratios reuse cached summary without invoking Gemini."""
+        mock_response = MagicMock()
+        mock_response.text = "## 🏢 Executive Overview\nCached summary content [Page 3]."
+        self.mock_client.models.generate_content.return_value = mock_response
+
+        summary1 = self.generator.generate_summary(self.report, self.ratios)
+        self.assertEqual(self.mock_client.models.generate_content.call_count, 1)
+
+        # Second call with identical data hits cache
+        summary2 = self.generator.generate_summary(self.report, self.ratios)
+        self.assertEqual(self.mock_client.models.generate_content.call_count, 1)
+        self.assertEqual(summary1.summary_text, summary2.summary_text)
+
+    def test_non_transient_error_fails_immediately_without_wasteful_retries(self) -> None:
+        """Verify non-transient error like invalid key does not trigger retry loop."""
+        self.mock_client.models.generate_content.side_effect = Exception("400 Bad Request: Invalid API key")
+
+        summary = self.generator.generate_summary(self.report, self.ratios)
+
+        self.assertIsNotNone(summary.error)
+        self.assertIn("Invalid API key", summary.error)
+        # Verify it called once and did not retry
+        self.assertEqual(self.mock_client.models.generate_content.call_count, 1)
 
 
 if __name__ == "__main__":

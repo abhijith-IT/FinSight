@@ -536,13 +536,23 @@ class HybridRetriever(BaseRetriever):
         self.vector_weight = vector_weight
         self.rrf_k = rrf_k
         self._chunks: List[DocumentChunk] = []
+        self.semantic_unavailable: bool = False
+        self.embedding_error: Optional[str] = None
 
     def index(self, chunks: Sequence[DocumentChunk]) -> None:
-        """Index chunks across both retrievers."""
+        """Index chunks across both retrievers with graceful fallback to BM25."""
         self._chunks = list(chunks)
         self.bm25_retriever.index(chunks)
         if self.vector_retriever and self.vector_retriever.embed_fn:
-            self.vector_retriever.index(chunks)
+            try:
+                self.vector_retriever.index(chunks)
+                self.semantic_unavailable = False
+                self.embedding_error = None
+            except Exception as e:
+                # If Gemini embedding generation fails (service error, 503, or quota limit),
+                # retain the indexed document in BM25 without discarding any cached embeddings
+                self.semantic_unavailable = True
+                self.embedding_error = str(e)
 
     def retrieve(
         self,
@@ -554,8 +564,9 @@ class HybridRetriever(BaseRetriever):
         if not self._chunks or not query or not query.strip():
             return []
 
-        # If vector retriever is not available or has no chunks, delegate directly to BM25
-        if not self.vector_retriever or self.vector_retriever.chunk_count == 0:
+        # If vector retriever is not available, has no chunks, or semantic retrieval is unavailable,
+        # delegate directly to BM25 keyword search
+        if not self.vector_retriever or self.vector_retriever.chunk_count == 0 or self.semantic_unavailable:
             return self.bm25_retriever.retrieve(query=query, top_k=top_k, min_score=min_score)
 
         pool_size = max(top_k * 3, 20)
@@ -563,8 +574,10 @@ class HybridRetriever(BaseRetriever):
 
         try:
             vector_hits = self.vector_retriever.retrieve(query=query, top_k=pool_size, min_score=0.0)
-        except Exception:
+        except Exception as e:
             # Fall back gracefully to BM25 if vector retriever fails during search
+            self.semantic_unavailable = True
+            self.embedding_error = str(e)
             return self.bm25_retriever.retrieve(query=query, top_k=top_k, min_score=min_score)
 
         if not bm25_hits and not vector_hits:
@@ -617,6 +630,8 @@ class HybridRetriever(BaseRetriever):
 
     def clear(self) -> None:
         self._chunks = []
+        self.semantic_unavailable = False
+        self.embedding_error = None
         self.bm25_retriever.clear()
         if self.vector_retriever:
             self.vector_retriever.clear()

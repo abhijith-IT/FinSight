@@ -548,5 +548,47 @@ class TestRAGPipelineDocumentCaching(unittest.TestCase):
         self.assertIsInstance(pipe_hybrid.retriever, HybridRetriever)
 
 
+class TestRAGImportsRegression(unittest.TestCase):
+    """Regression tests verifying RAGPipeline and create_rag_pipeline import stability."""
+
+    def test_import_from_rag_pipeline_module(self) -> None:
+        """Verify direct module import from rag.pipeline."""
+        from rag.pipeline import RAGPipeline, create_rag_pipeline
+
+        self.assertTrue(callable(create_rag_pipeline))
+        self.assertTrue(isinstance(RAGPipeline, type))
+
+    def test_import_from_rag_package_root(self) -> None:
+        """Verify package-level import from rag."""
+        from rag import RAGPipeline, create_rag_pipeline
+
+        self.assertTrue(callable(create_rag_pipeline))
+        self.assertTrue(isinstance(RAGPipeline, type))
+
+    def test_factory_supports_all_retriever_types(self) -> None:
+        """Verify create_rag_pipeline factory correctly supports hybrid, vector, and bm25."""
+        from unittest.mock import patch
+        import config
+        from rag.pipeline import create_rag_pipeline
+        from rag.retriever import BM25Retriever, HybridRetriever, VectorRetriever
+
+        # 1. BM25 explicit
+        pipe_bm25 = create_rag_pipeline(api_key=None, retriever_type="bm25")
+        self.assertIsInstance(pipe_bm25.retriever, BM25Retriever)
+
+        # 2. Hybrid explicit (with API key)
+        pipe_hybrid = create_rag_pipeline(api_key="mock_key", retriever_type="hybrid")
+        self.assertIsInstance(pipe_hybrid.retriever, HybridRetriever)
+
+        # 3. Vector explicit (with API key)
+        pipe_vector = create_rag_pipeline(api_key="mock_key", retriever_type="vector")
+        self.assertIsInstance(pipe_vector.retriever, VectorRetriever)
+
+        # 4. Fallback to BM25 when neither API key nor config key exists
+        with patch.object(config, "GEMINI_API_KEY", None):
+            pipe_fallback = create_rag_pipeline(api_key=None, retriever_type="vector")
+            self.assertIsInstance(pipe_fallback.retriever, BM25Retriever)
+
+
 if __name__ == "__main__":
     unittest.main()
