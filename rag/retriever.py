@@ -44,11 +44,225 @@ COMMON_STOPWORDS: Set[str] = {
     "while", "who", "whom", "why", "with", "would", "you", "your", "yours", "yourself",
 }
 
+# Domain-specific financial plurals and morphological variations
+SPECIAL_STEMS: Dict[str, str] = {
+    "liabilities": "liability",
+    "companies": "company",
+    "subsidiaries": "subsidiary",
+    "activities": "activity",
+    "securities": "security",
+    "disclosures": "disclosure",
+    "operations": "operation",
+    "operating": "operation",
+    "revenues": "revenue",
+    "expenses": "expense",
+    "earnings": "earning",
+    "borrowings": "borrowing",
+    "borrowed": "borrow",
+    "profits": "profit",
+    "losses": "loss",
+    "taxes": "tax",
+    "taxation": "tax",
+    "ratios": "ratio",
+    "factors": "factor",
+    "statements": "statement",
+    "assets": "asset",
+    "risks": "risk",
+    "segments": "segment",
+    "investments": "investment",
+    "commitments": "commitment",
+    "provisions": "provision",
+    "dividends": "dividend",
+    "margins": "margin",
+    "inventories": "inventory",
+    "receivables": "receivable",
+    "payables": "payable",
+    "impairments": "impairment",
+    "depreciations": "depreciation",
+    "amortisations": "amortisation",
+    "amortizations": "amortization",
+    "fluctuations": "fluctuation",
+    "derivatives": "derivative",
+    "hedging": "hedge",
+    "hedges": "hedge",
+}
+
+
+def stem_financial_term(term: str) -> str:
+    """Normalize inflected financial words to their singular/base forms."""
+    t = term.lower()
+    if t in SPECIAL_STEMS:
+        return SPECIAL_STEMS[t]
+    if t.endswith("ies") and len(t) > 4:
+        return t[:-3] + "y"
+    if t.endswith("es") and len(t) > 4:
+        if t[-3] in "sxz" or t.endswith("ches") or t.endswith("shes"):
+            return t[:-2]
+        return t[:-1]
+    if t.endswith("s") and len(t) > 3 and not t.endswith(("ss", "us", "is")):
+        return t[:-1]
+    return t
+
+
+def normalize_financial_term(term: str) -> List[str]:
+    """Extract canonical fiscal years and morphological stems for a term."""
+    t = term.lower()
+    # Canonicalize fiscal years: fy2025 -> 2025, fy25 -> 2025, 2024-25 -> 2025, 2024
+    m_fy = re.match(r"^fy(20\d\d)$", t)
+    if m_fy:
+        return [m_fy.group(1)]
+    m_fy_short = re.match(r"^fy(\d\d)$", t)
+    if m_fy_short:
+        return ["20" + m_fy_short.group(1)]
+    m_span = re.match(r"^(20\d\d)[-–](\d\d)$", t)
+    if m_span:
+        return ["20" + m_span.group(2), m_span.group(1)]
+
+    stemmed = stem_financial_term(t)
+    if stemmed != t:
+        return [t, stemmed]
+    return [t]
+
 
 def tokenize(text: str) -> List[str]:
-    """Tokenize text into lowercase alphanumeric terms and financial symbols."""
+    """Tokenize text into lowercase alphanumeric terms, financial symbols, and canonical stems."""
     raw_tokens = re.findall(r"\b[a-zA-Z0-9_\-\$]+\b", text.lower())
-    return [t for t in raw_tokens if t not in COMMON_STOPWORDS and len(t) > 1]
+    tokens: List[str] = []
+    for t in raw_tokens:
+        if t in COMMON_STOPWORDS or len(t) <= 1:
+            continue
+        norms = normalize_financial_term(t)
+        for n in norms:
+            if n not in COMMON_STOPWORDS and len(n) > 1:
+                tokens.append(n)
+    return tokens
+
+
+# Domain vocabulary for financial retrieval intent and statement authority
+RISK_QUERY_TERMS: List[str] = [
+    "risk", "risks", "threat", "threats", "hazard", "hazards",
+]
+
+RISK_INDICATOR_TERMS: List[str] = [
+    "risk", "threat", "hazard", "uncertaint",
+]
+
+RISK_HIGH_VALUE_TERMS: List[str] = [
+    "risk management", "enterprise risk", "market risk", "credit risk",
+    "liquidity risk", "risk factors", "principal risks", "financial risk",
+    "operational risk", "commodity price risk", "currency risk",
+    "interest rate risk", "foreign exchange risk", "mitigation",
+]
+
+METRIC_TERMS: List[str] = [
+    "revenue", "sales", "turnover", "profit", "income", "ebitda",
+    "asset", "assets", "debt", "borrowing", "borrowings", "equity",
+    "cash flow", "cash flows", "capex", "capital expenditure",
+]
+
+PRIMARY_CONSOLIDATED_STATEMENTS: List[str] = [
+    "consolidated statement of profit and loss",
+    "consolidated statement of profit & loss",
+    "consolidated balance sheet",
+    "consolidated statement of cash flows",
+    "consolidated cash flow statement",
+]
+
+CONSOLIDATED_TERMS: List[str] = [
+    "consolidated statement", "consolidated financial", "consolidated profit",
+    "consolidated revenue", "consolidated balance", "consolidated cash",
+    "consolidated results", "consolidated",
+]
+
+STANDALONE_TERMS: List[str] = [
+    "standalone statement", "standalone financial", "standalone profit",
+    "standalone balance", "standalone results", "standalone",
+]
+
+SEGMENT_DISCLOSURE_TERMS: List[str] = [
+    "segment reporting", "segment information", "segment revenue", "segment results",
+    "management discussion and analysis",
+]
+
+SEGMENT_QUERY_TERMS: List[str] = [
+    "segment", "division", "breakdown", "business line", "management discussion",
+]
+
+KEY_FINANCIAL_PHRASES: List[str] = [
+    "revenue from operations", "operating cash flow", "net cash flows",
+    "profit for the year", "enterprise risk management", "capital expenditure",
+    "balance sheet", "statement of profit and loss",
+]
+
+
+def _has_any(text: str, terms: Sequence[str]) -> bool:
+    """Return True if any term in terms is present in text."""
+    for term in terms:
+        if term in text:
+            return True
+    return False
+
+
+def apply_financial_domain_boost(chunk_text: str, query: str, base_score: float) -> float:
+    """Adjust retrieval score based on financial domain intent and section authority.
+
+    1. Risk Queries:
+       - Prioritizes Enterprise Risk Management (ERM), financial risk factors,
+         and specific risk categories (market, credit, liquidity, operational).
+       - Strongly penalizes chunks that do not discuss risk when query is explicitly about risks.
+    2. Enterprise Financial Metric Queries:
+       - Prioritizes Consolidated financial statements as primary for corporate metrics
+         (revenue, net profit, debt, equity, cash flow, EBITDA) unless standalone is requested.
+       - Demotes standalone parent statements and segment-only breakdowns when general
+         company figures are queried.
+       - If standalone is explicitly requested, prioritizes standalone chunks.
+    3. Multi-word Financial Phrase Co-occurrence:
+       - Boosts chunks matching exact key phrases like 'revenue from operations',
+         'operating cash flow', or 'enterprise risk management'.
+    """
+    score = base_score
+    c_lower = chunk_text.lower()
+    q_lower = query.lower()
+
+    # 1. Risk Intent
+    if _has_any(q_lower, RISK_QUERY_TERMS):
+        if _has_any(c_lower, RISK_INDICATOR_TERMS):
+            if _has_any(c_lower, RISK_HIGH_VALUE_TERMS):
+                score *= 1.75
+            else:
+                score *= 1.25
+        else:
+            # Demote chunks that do not discuss risk when query is specifically about risks
+            score *= 0.15
+
+    # 2. Financial Metrics Intent (Consolidated vs Standalone / Segment)
+    if _has_any(q_lower, METRIC_TERMS):
+        if "standalone" in q_lower:
+            # Standalone metrics explicitly requested
+            if "standalone" in c_lower:
+                score *= 1.60
+            elif "consolidated" in c_lower:
+                score *= 0.60
+        else:
+            # Enterprise / consolidated metrics prioritized by default
+            if _has_any(c_lower, PRIMARY_CONSOLIDATED_STATEMENTS):
+                score *= 1.85
+            elif _has_any(c_lower, CONSOLIDATED_TERMS):
+                score *= 1.60
+            elif _has_any(c_lower, STANDALONE_TERMS):
+                score *= 0.55
+
+            # Demote segment disclosures and MD&A when enterprise totals are queried
+            if _has_any(c_lower, SEGMENT_DISCLOSURE_TERMS) and not _has_any(q_lower, SEGMENT_QUERY_TERMS):
+                score *= 0.70
+
+    # 3. Exact Key Financial Phrases
+    for kp in KEY_FINANCIAL_PHRASES:
+        if kp in q_lower and kp in c_lower:
+            score *= 1.25
+            break
+
+    return score
 
 
 def jaccard_similarity(set_a: Set[str], set_b: Set[str]) -> float:
@@ -351,6 +565,11 @@ class BM25Retriever(BaseRetriever):
                 term_score = idf * (numerator / denominator) * q_weight
                 scores[doc_idx] += term_score
 
+        # Apply financial domain intent and section boosting
+        for doc_idx in list(scores.keys()):
+            chunk_text = self._chunks[doc_idx].text
+            scores[doc_idx] = apply_financial_domain_boost(chunk_text, query, scores[doc_idx])
+
         # Filter out candidates below min_score (guarantees irrelevant results are dropped)
         effective_min = max(0.0, min_score)
         eligible = [(doc_idx, s) for doc_idx, s in scores.items() if s > effective_min]
@@ -597,6 +816,11 @@ class HybridRetriever(BaseRetriever):
             cid = hit.chunk_id
             rrf_scores[cid] += self.vector_weight / (self.rrf_k + rank)
             chunk_map[cid] = hit.chunk
+
+        # Apply financial domain intent and section boosting to fused scores
+        for cid in list(rrf_scores.keys()):
+            chunk = chunk_map[cid]
+            rrf_scores[cid] = apply_financial_domain_boost(chunk.text, query, rrf_scores[cid])
 
         # Sort descending by fused score
         ranked_items = sorted(rrf_scores.items(), key=lambda x: x[1], reverse=True)

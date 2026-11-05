@@ -22,18 +22,20 @@ class DocumentChunker:
 
     def __init__(
         self,
-        chunk_size: int = 500,
-        chunk_overlap: int = 100,
+        chunk_size: int = 1200,
+        chunk_overlap: int = 300,
         min_chunk_size: int = 20,
         separators: Optional[List[str]] = None,
+        attach_header_context: bool = True,
     ) -> None:
         """Initialize chunker parameters.
 
         Args:
-            chunk_size: Target maximum characters per chunk.
+            chunk_size: Target maximum characters per chunk (default 1200 for financial tables).
             chunk_overlap: Number of characters to overlap between consecutive chunks.
             min_chunk_size: Minimum character length for a chunk to be retained.
             separators: Hierarchical list of separators to split text on.
+            attach_header_context: Whether to preserve page section headers across chunks.
         """
         if chunk_size <= 0:
             raise ValueError(f"chunk_size must be positive, got {chunk_size}")
@@ -48,6 +50,7 @@ class DocumentChunker:
         self.chunk_overlap = chunk_overlap
         self.min_chunk_size = min_chunk_size
         self.separators = separators or list(DEFAULT_SEPARATORS)
+        self.attach_header_context = attach_header_context
 
     def chunk_page(
         self,
@@ -57,6 +60,8 @@ class DocumentChunker:
         """Split a single ParsedPage into overlapping DocumentChunk objects.
 
         Preserves the original 1-indexed page_number from ParsedPage.
+        Propagates page section headings to prevent financial tables from being
+        severed from their statement headings.
 
         Args:
             page: ParsedPage instance from ingestion.
@@ -68,6 +73,17 @@ class DocumentChunker:
         if not page or not page.has_text or not page.text or not page.text.strip():
             return []
 
+        # Extract page header / section title from the first 1-3 non-empty lines
+        page_header = ""
+        if self.attach_header_context and self.chunk_size >= 400:
+            lines = [line.strip() for line in page.text.split("\n") if line.strip()]
+            header_lines = []
+            for line in lines[:3]:
+                if len(line) < 120 and not re.match(r"^\d+$", line):
+                    header_lines.append(line)
+            if header_lines:
+                page_header = " | ".join(header_lines)
+
         raw_chunks = self._split_text(page.text.strip())
         document_chunks: List[DocumentChunk] = []
 
@@ -77,16 +93,22 @@ class DocumentChunker:
             if not cleaned_text:
                 continue
 
+            # Contextualize chunk with page header if not already at the start
+            if page_header and not cleaned_text.startswith(page_header[:35]):
+                contextualized_text = f"[{page_header}]\n{cleaned_text}"
+            else:
+                contextualized_text = cleaned_text
+
             chunk_id = f"{doc_id}_p{page.page_number}_c{idx}"
             document_chunks.append(
                 DocumentChunk(
                     chunk_id=chunk_id,
                     page_number=page.page_number,
-                    text=cleaned_text,
-                    char_count=len(cleaned_text),
-                    token_count=len(cleaned_text.split()),
+                    text=contextualized_text,
+                    char_count=len(contextualized_text),
+                    token_count=len(contextualized_text.split()),
                     chunk_index=idx,
-                    metadata={"page": page.page_number, "doc_id": doc_id},
+                    metadata={"page": page.page_number, "doc_id": doc_id, "header": page_header},
                 )
             )
 

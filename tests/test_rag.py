@@ -98,6 +98,37 @@ class TestDocumentChunker(unittest.TestCase):
         self.assertEqual(len(chunks), 1)
         self.assertEqual(chunks[0].text, short_text)
         self.assertEqual(chunks[0].page_number, 2)
+
+    def test_header_context_attached_to_subsequent_chunks(self) -> None:
+        """Verify page headers are prepended to subsequent chunks for contextual grounding."""
+        header_text = "CONSOLIDATED FINANCIAL STATEMENTS\nNotes to Financial Statements\n\n"
+        body_text = (
+            "Note 1: Significant accounting policies.\n"
+            "The consolidated financial statements have been prepared in accordance with GAAP.\n"
+            "Revenue is recognized when control of the promised goods or services is transferred.\n\n"
+            "Note 2: Operating revenue breakdown.\n"
+            "Revenue from operations comprises sale of products and services across multiple divisions.\n"
+            "Division A recorded strong customer adoption and multi-year contract renewals.\n"
+            "Division B experienced steady operational improvements and margin expansion.\n\n"
+            "Note 3: Total consolidated revenue reached $5,000 million for the reporting year."
+        )
+        full_text = header_text + body_text
+        page = ParsedPage(page_number=50, text=full_text, has_text=True, char_count=len(full_text))
+
+        # Chunk with header context enabled
+        chunker_with_header = DocumentChunker(chunk_size=400, chunk_overlap=80, attach_header_context=True)
+        chunks = chunker_with_header.chunk_page(page, doc_id="doc_header")
+
+        self.assertGreater(len(chunks), 1)
+        # First chunk has the header in its natural text
+        self.assertIn("CONSOLIDATED FINANCIAL STATEMENTS", chunks[0].text)
+
+        # Subsequent chunks must have the header context prepended
+        for c in chunks[1:]:
+            self.assertTrue(
+                c.text.startswith("[CONSOLIDATED FINANCIAL STATEMENTS") or "CONSOLIDATED FINANCIAL STATEMENTS" in c.text,
+                f"Subsequent chunk should contain page header context: {c.text[:80]}",
+            )
         self.assertEqual(chunks[0].chunk_index, 0)
 
     def test_empty_and_blank_pages_produce_no_chunks(self) -> None:
@@ -588,6 +619,129 @@ class TestRAGImportsRegression(unittest.TestCase):
         with patch.object(config, "GEMINI_API_KEY", None):
             pipe_fallback = create_rag_pipeline(api_key=None, retriever_type="vector")
             self.assertIsInstance(pipe_fallback.retriever, BM25Retriever)
+
+
+class TestRetrievalDomainRankingAndStemming(unittest.TestCase):
+    """Test suite for financial domain ranking, stemming, and section prioritization."""
+
+    def test_tokenize_stems_financial_plurals_and_canonicalizes_fiscal_years(self) -> None:
+        """Verify tokenization normalizes plurals and fiscal year formats into matching tokens."""
+        # Plural stemming
+        risk_tokens = tokenize("What are the major financial risks?")
+        self.assertIn("risk", risk_tokens)
+        self.assertIn("financial", risk_tokens)
+
+        # Fiscal year variants
+        fy_tokens = tokenize("What was the revenue from operations in FY2025?")
+        self.assertIn("revenue", fy_tokens)
+        self.assertIn("operation", fy_tokens)
+        self.assertIn("2025", fy_tokens)
+
+        # Year span variants
+        span_tokens = tokenize("Annual report for FY 2024-25")
+        self.assertIn("2025", span_tokens)
+        self.assertIn("2024", span_tokens)
+
+    def test_consolidated_financial_statement_prioritized_over_standalone(self) -> None:
+        """Verify enterprise financial queries prioritize Consolidated over Standalone statements."""
+        chunks = [
+            DocumentChunk(
+                chunk_id="chunk_sa",
+                page_number=320,
+                text="Standalone Statement of Profit and Loss: Revenue from operations was $3,000 million for FY2025.",
+                char_count=98,
+            ),
+            DocumentChunk(
+                chunk_id="chunk_con",
+                page_number=410,
+                text="Consolidated Statement of Profit and Loss for the year ended March 31, 2025. "
+                     "Revenue from operations reached $10,000 million compared to $9,000 million in prior year.",
+                char_count=175,
+            ),
+        ]
+        retriever = BM25Retriever()
+        retriever.index(chunks)
+
+        # General query should prioritize consolidated
+        results = retriever.retrieve("What was the revenue from operations in FY2025?", top_k=2)
+        self.assertEqual(len(results), 2)
+        self.assertEqual(results[0].page_number, 410)
+        self.assertEqual(results[0].chunk_id, "chunk_con")
+        self.assertIn("consolidated", results[0].text.lower())
+
+        # Explicit standalone query should prioritize standalone
+        results_sa = retriever.retrieve("What was the standalone revenue from operations?", top_k=2)
+        self.assertEqual(results_sa[0].page_number, 320)
+        self.assertEqual(results_sa[0].chunk_id, "chunk_sa")
+
+    def test_risk_management_section_prioritized_over_generic_financial_page(self) -> None:
+        """Verify questions about financial risks prioritize ERM over generic pages containing 'financial'."""
+        chunks = [
+            DocumentChunk(
+                chunk_id="chunk_gen",
+                page_number=10,
+                text="The company achieved major financial success with strong financial discipline and capital allocation.",
+                char_count=100,
+            ),
+            DocumentChunk(
+                chunk_id="chunk_erm",
+                page_number=45,
+                text="Enterprise Risk Management: The Company is exposed to market risk, credit risk and liquidity risk "
+                     "in the normal course of business operations.",
+                char_count=145,
+            ),
+        ]
+        retriever = BM25Retriever()
+        retriever.index(chunks)
+
+        results = retriever.retrieve("What are the major financial risks?", top_k=2)
+        self.assertGreater(len(results), 0)
+        # ERM chunk must be rank 1
+        self.assertEqual(results[0].page_number, 45)
+        self.assertEqual(results[0].chunk_id, "chunk_erm")
+        self.assertIn("enterprise risk management", results[0].text.lower())
+
+    def test_consolidated_statement_prioritized_over_segment_disclosures(self) -> None:
+        """Verify general corporate revenue query prioritizes consolidated financial statements over segment tables."""
+        chunks = [
+            DocumentChunk(
+                chunk_id="chunk_seg_overview",
+                page_number=14,
+                text="Management Discussion and Analysis - Business Overview: Segment Alpha revenue from operations was $2,400 million.",
+                char_count=114,
+            ),
+            DocumentChunk(
+                chunk_id="chunk_cons_pl",
+                page_number=102,
+                text="Consolidated Statement of Profit and Loss for the year ended March 31, 2025. "
+                     "Revenue from operations was $9,600 million compared to $8,700 million in FY2024.",
+                char_count=161,
+            ),
+            DocumentChunk(
+                chunk_id="chunk_seg_reporting",
+                page_number=135,
+                text="Notes to Accounts: Segment Reporting. Segment Alpha: $2,400 million, Segment Beta: $7,200 million. "
+                     "Total Segment Revenue from operations: $9,600 million.",
+                char_count=167,
+            ),
+        ]
+        retriever = BM25Retriever()
+        retriever.index(chunks)
+
+        # General corporate query should rank Consolidated Statement of Profit & Loss #1
+        results = retriever.retrieve("What was the revenue from operations in FY2025?", top_k=3)
+        self.assertGreater(len(results), 0)
+        self.assertEqual(results[0].chunk_id, "chunk_cons_pl")
+        self.assertEqual(results[0].page_number, 102)
+
+        # Segment-specific query should retrieve the segment disclosure
+        results_seg = retriever.retrieve("What was Segment Alpha revenue from operations?", top_k=3)
+        self.assertGreater(len(results_seg), 0)
+        seg_cids = [r.chunk_id for r in results_seg[:2]]
+        self.assertTrue(
+            "chunk_seg_overview" in seg_cids or "chunk_seg_reporting" in seg_cids,
+            f"Segment query should prioritize segment disclosures: {seg_cids}",
+        )
 
 
 if __name__ == "__main__":

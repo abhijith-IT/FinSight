@@ -15,6 +15,7 @@ import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
+import re
 
 import config
 from analytics.ratios import (
@@ -865,17 +866,23 @@ def render_financial_tables(
         )
 
 
+RAG_PIPELINE_CACHE_VERSION = "v3_header_context_1200"
+
+
 @st.cache_resource(show_spinner=False)
 def get_cached_rag_pipeline(
     file_hash: str,
     _parsed_pdf: ParsedPDF,
     api_key: Optional[str] = None,
     doc_id: Optional[str] = None,
+    cache_version: str = RAG_PIPELINE_CACHE_VERSION,
 ) -> RAGPipeline:
     """Create and cache the RAGPipeline with indexed document chunks and embeddings."""
     pipeline = create_rag_pipeline(
         api_key=api_key,
         retriever_type="hybrid" if api_key else "bm25",
+        chunk_size=1200,
+        chunk_overlap=300,
     )
     pipeline.ingest(_parsed_pdf, doc_id=doc_id)
     return pipeline
@@ -889,7 +896,8 @@ def get_or_create_rag_pipeline(
 ) -> Optional[RAGPipeline]:
     """Retrieve existing RAG pipeline from session state or cached resource."""
     if "rag_pipeline" in st.session_state and st.session_state.rag_pipeline is not None:
-        return st.session_state.rag_pipeline
+        if getattr(st.session_state.rag_pipeline, "_version", None) == RAG_PIPELINE_CACHE_VERSION:
+            return st.session_state.rag_pipeline
     if parsed_pdf is not None and parsed_pdf.pages:
         effective_hash = file_hash or st.session_state.get("uploaded_file_hash") or "default_doc"
         effective_doc_id = doc_id or st.session_state.get("uploaded_filename", "document.pdf")
@@ -899,7 +907,9 @@ def get_or_create_rag_pipeline(
             _parsed_pdf=parsed_pdf,
             api_key=effective_api_key,
             doc_id=effective_doc_id,
+            cache_version=RAG_PIPELINE_CACHE_VERSION,
         )
+        setattr(pipeline, "_version", RAG_PIPELINE_CACHE_VERSION)
         st.session_state.rag_pipeline = pipeline
         return pipeline
     return None
@@ -1004,7 +1014,7 @@ def render_qa_chat(api_key: Optional[str], model_name: str) -> None:
                 api_key=api_key,
                 model_name=model_name,
                 fallback_model_name=fallback_model,
-                top_k=5,
+                top_k=6,
             )
             qa_result = qa_engine.answer_question(effective_query, pipeline)
 

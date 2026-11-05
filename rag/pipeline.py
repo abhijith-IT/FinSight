@@ -144,8 +144,8 @@ def create_rag_pipeline(
     client: Optional[genai.Client] = None,
     retriever_type: str = "hybrid",
     embedding_model: Optional[str] = None,
-    chunk_size: int = 500,
-    chunk_overlap: int = 100,
+    chunk_size: int = 1200,
+    chunk_overlap: int = 300,
 ) -> RAGPipeline:
     """Factory creating a fully configured RAGPipeline.
 
