@@ -238,7 +238,7 @@ def apply_financial_domain_boost(chunk_text: str, query: str, base_score: float)
     # 2. Financial Metrics Intent (Consolidated vs Standalone / Segment)
     if _has_any(q_lower, METRIC_TERMS):
         if "standalone" in q_lower:
-            # Standalone metrics explicitly requested
+            # Standalone metrics explicitly+ requested
             if "standalone" in c_lower:
                 score *= 1.60
             elif "consolidated" in c_lower:
