@@ -367,6 +367,128 @@ class TestRAGEmbeddingFallback(unittest.TestCase):
         self.assertEqual(pipeline.embedding_error, "Gemini embedding quota exceeded")
 
 
+class TestPDFExportEnhancements(unittest.TestCase):
+    """Test suite for PDF export enhancements: dynamic audit, chart gaps/negatives, and XML escaping."""
+
+    def test_escape_xml_utility(self) -> None:
+        """Verify XML escaping converts &, <, > properly."""
+        from generation.export import _escape_xml
+        self.assertEqual(_escape_xml("AT&T"), "AT&amp;T")
+        self.assertEqual(_escape_xml("<script>alert('x')</script>"), "&lt;script&gt;alert('x')&lt;/script&gt;")
+        self.assertEqual(_escape_xml("Revenue & Profit > Target"), "Revenue &amp; Profit &gt; Target")
+        self.assertEqual(_escape_xml(None), "")
+
+    def test_create_performance_chart_with_gaps_and_negatives(self) -> None:
+        """Verify chart creates gaps for missing values (None) and supports negative net profit."""
+        from generation.export import _create_performance_chart
+        reports = [
+            AnnualFinancialData(
+                year=2023,
+                income_statement=IncomeStatement(
+                    revenue=FinancialValue(value=1000.0, source_page=2),
+                    net_profit=FinancialValue(value=-250.0, source_page=2),  # Net loss
+                ),
+            ),
+            AnnualFinancialData(
+                year=2024,
+                income_statement=IncomeStatement(
+                    revenue=FinancialValue(value=None, is_unavailable=True),  # Missing revenue
+                    net_profit=FinancialValue(value=300.0, source_page=2),
+                ),
+            ),
+        ]
+        drawing = _create_performance_chart(reports)
+        self.assertIsNotNone(drawing)
+        # Verify chart data in the drawing
+        # First series is revenue: [1000.0, None]
+        # Second series is net profit: [-250.0, 300.0]
+        chart = drawing.contents[0]
+        self.assertEqual(chart.data[0], [1000.0, None])
+        self.assertEqual(chart.data[1], [-250.0, 300.0])
+        # valueMin must be negative to accommodate the net loss
+        self.assertLess(chart.valueAxis.valueMin, 0.0)
+
+    def test_generate_executive_pdf_with_xml_special_characters(self) -> None:
+        """Verify PDF export does not crash when company name or notes contain &, <, >."""
+        report = FinancialExtractionReport(
+            company_name="Johnson & Johnson <Healthcare> Group",
+            extraction_notes=["Revenue > 100M & Net Margin < 15%"],
+            annual_reports=[
+                AnnualFinancialData(
+                    year=2024,
+                    currency="USD",
+                    unit="millions",
+                    income_statement=IncomeStatement(
+                        revenue=FinancialValue(value=500.0, source_page=1),
+                        net_profit=FinancialValue(value=50.0, source_page=1),
+                    ),
+                    balance_sheet=BalanceSheet(
+                        total_assets=FinancialValue(value=1000.0, source_page=2),
+                        total_liabilities=FinancialValue(value=400.0, source_page=2),
+                        equity=FinancialValue(value=600.0, source_page=2),
+                    ),
+                ),
+            ],
+        )
+        ratios = calculate_report_ratios(report)
+        pdf_bytes = generate_executive_pdf(report, ratios)
+        self.assertIsInstance(pdf_bytes, bytes)
+        self.assertTrue(pdf_bytes.startswith(b"%PDF"))
+
+    def test_dynamic_balance_sheet_verification_in_pdf(self) -> None:
+        """Verify dynamic verification detects verified, discrepancy, and missing checks."""
+        # 1. Balanced: Assets (1000) == Liabilities (400) + Equity (600)
+        report_balanced = FinancialExtractionReport(
+            company_name="Balanced Corp",
+            annual_reports=[
+                AnnualFinancialData(
+                    year=2024,
+                    balance_sheet=BalanceSheet(
+                        total_assets=FinancialValue(value=1000.0, source_page=2),
+                        total_liabilities=FinancialValue(value=400.0, source_page=2),
+                        equity=FinancialValue(value=600.0, source_page=2),
+                    ),
+                ),
+            ],
+        )
+        pdf_balanced = generate_executive_pdf(report_balanced, [])
+        self.assertIsInstance(pdf_balanced, bytes)
+
+        # 2. Discrepancy: Assets (1000) != Liabilities (400) + Equity (300)
+        report_discrepancy = FinancialExtractionReport(
+            company_name="Discrepancy Corp",
+            annual_reports=[
+                AnnualFinancialData(
+                    year=2024,
+                    balance_sheet=BalanceSheet(
+                        total_assets=FinancialValue(value=1000.0, source_page=2),
+                        total_liabilities=FinancialValue(value=400.0, source_page=2),
+                        equity=FinancialValue(value=300.0, source_page=2),
+                    ),
+                ),
+            ],
+        )
+        pdf_discrepancy = generate_executive_pdf(report_discrepancy, [])
+        self.assertIsInstance(pdf_discrepancy, bytes)
+
+        # 3. Missing item: Equity not reported
+        report_missing = FinancialExtractionReport(
+            company_name="Missing Item Corp",
+            annual_reports=[
+                AnnualFinancialData(
+                    year=2024,
+                    balance_sheet=BalanceSheet(
+                        total_assets=FinancialValue(value=1000.0, source_page=2),
+                        total_liabilities=FinancialValue(value=400.0, source_page=2),
+                        equity=FinancialValue(value=None, is_unavailable=True),
+                    ),
+                ),
+            ],
+        )
+        pdf_missing = generate_executive_pdf(report_missing, [])
+        self.assertIsInstance(pdf_missing, bytes)
+
+
 if __name__ == "__main__":
     unittest.main()
 

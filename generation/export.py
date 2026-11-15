@@ -7,6 +7,7 @@ using ReportLab, with strict data provenance, ratio calculations, and unavailabl
 from __future__ import annotations
 
 import datetime
+import html
 import io
 import re
 from typing import Any, Dict, List, Optional, Sequence, Tuple
@@ -36,6 +37,13 @@ from extraction.financial_schema import (
     FinancialValue,
 )
 from generation.summary import ExecutiveSummary
+
+
+def _escape_xml(text: Optional[str]) -> str:
+    """Escape XML/HTML special characters (&, <, >) for ReportLab Paragraph elements."""
+    if not text:
+        return ""
+    return html.escape(str(text), quote=False)
 
 
 def _safe_val_and_page(
@@ -200,37 +208,54 @@ def _create_performance_chart(
     width: float = 540,
     height: float = 160,
 ) -> Optional[Drawing]:
-    """Generate a standalone ReportLab vector bar chart of Revenue & Net Profit."""
+    """Generate a standalone ReportLab vector bar chart of Revenue & Net Profit.
+
+    Maintains data integrity:
+    - Missing/unavailable values are represented as gaps (None), NOT zero.
+    - Genuine zero values (0.0) remain 0.0.
+    - Negative values (losses) are preserved as negative without clipping.
+    """
     years = [a.year for a in annual_reports]
-    rev_vals: List[float] = []
-    np_vals: List[float] = []
+    rev_vals: List[Optional[float]] = []
+    np_vals: List[Optional[float]] = []
     has_valid_data = False
+    has_gaps = False
 
     for a in annual_reports:
         rev, _, unavail_r = _safe_val_and_page(a.income_statement, "revenue")
-        np, _, unavail_np = _safe_val_and_page(a.income_statement, "net_profit")
+        np_val, _, unavail_np = _safe_val_and_page(a.income_statement, "net_profit")
 
         if not unavail_r and rev is not None:
-            rev_vals.append(max(0.0, rev))
+            rev_vals.append(float(rev))
             has_valid_data = True
         else:
-            rev_vals.append(0.0)
+            rev_vals.append(None)
+            has_gaps = True
 
-        if not unavail_np and np is not None:
-            np_vals.append(np)
+        if not unavail_np and np_val is not None:
+            np_vals.append(float(np_val))
             has_valid_data = True
         else:
-            np_vals.append(0.0)
+            np_vals.append(None)
+            has_gaps = True
 
     if not has_valid_data:
         return None
+
+    # Calculate dynamic min and max across all valid values to support negative profits
+    valid_numbers = [v for v in rev_vals + np_vals if v is not None]
+    if not valid_numbers:
+        return None
+
+    min_num = min(valid_numbers)
+    max_num = max(valid_numbers)
 
     drawing = Drawing(width, height)
 
     chart = VerticalBarChart()
     chart.x = 60
     chart.y = 25
-    chart.height = height - 55
+    chart.height = height - 58
     chart.width = width - 110
     chart.data = [rev_vals, np_vals]
     chart.categoryAxis.categoryNames = [f"FY {y}" for y in years]
@@ -238,7 +263,17 @@ def _create_performance_chart(
     chart.categoryAxis.labels.fontName = "Helvetica"
     chart.categoryAxis.labels.fillColor = colors.HexColor("#0F172A")
 
-    chart.valueAxis.valueMin = min(0.0, min(np_vals) if np_vals else 0.0)
+    # Proper Y-axis scaling supporting negative numbers
+    if min_num < 0:
+        chart.valueAxis.valueMin = min_num * 1.15
+    else:
+        chart.valueAxis.valueMin = 0.0
+
+    if max_num > 0:
+        chart.valueAxis.valueMax = max_num * 1.15
+    else:
+        chart.valueAxis.valueMax = 100.0
+
     chart.valueAxis.labels.fontSize = 7
     chart.valueAxis.labels.fontName = "Helvetica"
     chart.valueAxis.labels.fillColor = colors.HexColor("#64748B")
@@ -255,12 +290,13 @@ def _create_performance_chart(
     curr = annual_reports[0].currency or ""
     unit = annual_reports[0].unit or ""
     curr_tag = f" ({curr} in {unit})" if curr or unit else ""
+    gap_notice = " [Gaps indicate metrics unavailable in source]" if has_gaps else ""
     title_str = String(
         60,
         height - 14,
-        f"Multi-Year Financial Trajectory: Revenue vs. Net Profit{curr_tag}",
+        f"Multi-Year Financial Trajectory: Revenue vs. Net Profit{curr_tag}{gap_notice}",
         fontName="Helvetica-Bold",
-        fontSize=9,
+        fontSize=8.5,
         fillColor=colors.HexColor("#1E3A8A"),
     )
     drawing.add(title_str)
@@ -296,10 +332,11 @@ def generate_executive_pdf(
     - Company name, reporting years, base currency, and unit
     - Incomplete extraction warning banner if applicable
     - AI Executive Summary with key observations and drivers
-    - ReportLab vector bar chart of multi-year performance
+    - ReportLab vector bar chart of multi-year performance with gap preservation
     - Consolidated statements table with explicit page citations
     - Pure-Python calculated financial ratios table
-    - Accounting validation checks and data provenance
+    - Accounting validation checks (verified vs unperformed checks dynamically determined)
+    - Full XML escaping for dynamic text elements
 
     Args:
         report: FinancialExtractionReport instance.
@@ -423,16 +460,16 @@ def generate_executive_pdf(
 
     story: List[Any] = []
 
-    # 1. Title Banner
-    comp_name = report.company_name or "Financial Report Analysis"
-    story.append(Paragraph(comp_name, title_style))
+    # 1. Title Banner (Safely XML-escaped)
+    raw_comp_name = report.company_name or "Financial Report Analysis"
+    story.append(Paragraph(_escape_xml(raw_comp_name), title_style))
 
     annual_reports = sorted(report.annual_reports, key=lambda a: a.year) if report.annual_reports else []
     if annual_reports:
         year_span = f"Fiscal Years {annual_reports[0].year} – {annual_reports[-1].year}"
         curr = annual_reports[0].currency or ""
         unit = annual_reports[0].unit or ""
-        scale_tag = f" | Currency: {curr} ({unit})" if curr or unit else ""
+        scale_tag = f" | Currency: {_escape_xml(curr)} ({_escape_xml(unit)})" if curr or unit else ""
     else:
         year_span = "Fiscal Years (None extracted)"
         scale_tag = ""
@@ -449,7 +486,7 @@ def generate_executive_pdf(
             failed_info.append(f"Failed sections: {report.failed_sections}")
         if getattr(report, "unprocessed_sections", None):
             failed_info.append(f"Skipped sections: {report.unprocessed_sections}")
-        detail_msg = f" ({'; '.join(failed_info)})" if failed_info else ""
+        detail_msg = f" ({_escape_xml('; '.join(failed_info))})" if failed_info else ""
 
         warn_text = (
             f"<b>⚠️ Incomplete Extraction Notice:</b> High demand or transient model limits (HTTP 503 / 429) "
@@ -476,7 +513,7 @@ def generate_executive_pdf(
 
     summary_text = summary.summary_text if summary and summary.summary_text else ""
     if summary_text:
-        # Convert clean markdown lines to PDF paragraphs
+        # Convert clean markdown lines to PDF paragraphs with proper XML escaping
         lines = summary_text.splitlines()
         for line in lines:
             line_str = line.strip()
@@ -487,15 +524,17 @@ def generate_executive_pdf(
             if line_str.startswith("## ") or line_str.startswith("### "):
                 clean_h = re.sub(r"^#+\s*", "", line_str)
                 story.append(Spacer(1, 3))
-                story.append(Paragraph(f"<b>{clean_h}</b>", ParagraphStyle("SubH", parent=body_style, fontName="Helvetica-Bold", fontSize=9, textColor=colors.HexColor("#1E3A8A"))))
+                story.append(Paragraph(f"<b>{_escape_xml(clean_h)}</b>", ParagraphStyle("SubH", parent=body_style, fontName="Helvetica-Bold", fontSize=9, textColor=colors.HexColor("#1E3A8A"))))
             elif line_str.startswith("- ") or line_str.startswith("* "):
                 bullet_content = line_str[2:].strip()
-                # Format bold markdown **text** to <b>text</b>
-                bullet_content = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", bullet_content)
-                story.append(Paragraph(f"• {bullet_content}", bullet_style))
+                # Escape XML, then format bold markdown **text** to <b>text</b>
+                escaped_bullet = _escape_xml(bullet_content)
+                formatted_bullet = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", escaped_bullet)
+                story.append(Paragraph(f"• {formatted_bullet}", bullet_style))
             else:
-                body_content = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", line_str)
-                story.append(Paragraph(body_content, body_style))
+                escaped_body = _escape_xml(line_str)
+                formatted_body = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", escaped_body)
+                story.append(Paragraph(formatted_body, body_style))
     else:
         story.append(Paragraph("No executive narrative has been synthesized for this document.", body_style))
 
@@ -532,7 +571,7 @@ def generate_executive_pdf(
 
     ratio_table_data = [ratio_header]
     for label, val_fn in ratio_rows_def:
-        row_cells = [Paragraph(f"<b>{label}</b>", table_cell_style)]
+        row_cells = [Paragraph(f"<b>{_escape_xml(label)}</b>", table_cell_style)]
         for y in years:
             r_obj = ratio_map.get(y)
             txt = val_fn(r_obj)
@@ -598,8 +637,8 @@ def generate_executive_pdf(
 
     for stmt_name, metric_name, stmt_attr, field_attr in stmt_rows_def:
         row_cells = [
-            Paragraph(f"<font color='#64748B'>{stmt_name}</font>", table_cell_style),
-            Paragraph(f"<b>{metric_name}</b>", table_cell_style),
+            Paragraph(f"<font color='#64748B'>{_escape_xml(stmt_name)}</font>", table_cell_style),
+            Paragraph(f"<b>{_escape_xml(metric_name)}</b>", table_cell_style),
         ]
         for a in annual_reports:
             val, pg, is_unavail = _safe_val_and_page(getattr(a, stmt_attr, None), field_attr)
@@ -627,20 +666,60 @@ def generate_executive_pdf(
     story.append(stmt_table)
     story.append(Spacer(1, 10))
 
-    # 7. Audit & Validation Notices
-    story.append(Paragraph("4. Data Provenance & Statement Audit Notes", section_heading))
+    # 7. Audit & Validation Notices (Dynamically verified accounting checks)
+    story.append(Paragraph("4. Data Provenance & Accounting Validation Notes", section_heading))
     all_pages = sorted({p for a in annual_reports for p in a.source_pages})
     pages_str = ", ".join(f"Page {p}" for p in all_pages) if all_pages else "None recorded"
 
-    audit_lines = [
-        f"<b>Source Verification:</b> Extracted directly from annual report PDF pages: {pages_str}.",
-        "<b>Accounting Consistency:</b> Balance Sheet equation (Assets = Liabilities + Equity) validated across all extracted periods.",
-        "<b>Methodological Guardrails:</b> Missing metrics are flagged as Unavailable; zero values and missing values are strictly segregated.",
+    audit_items: List[str] = [
+        f"<b>Source Verification:</b> Extracted directly from audited report PDF pages: {pages_str}.",
     ]
-    for aline in audit_lines:
-        story.append(Paragraph(f"• {aline}", bullet_style))
+
+    # Dynamically verify Balance Sheet accounting equation for each period
+    for a in annual_reports:
+        assets, _, unavail_a = _safe_val_and_page(a.balance_sheet, "total_assets")
+        liab, _, unavail_l = _safe_val_and_page(a.balance_sheet, "total_liabilities")
+        eq, _, unavail_e = _safe_val_and_page(a.balance_sheet, "equity")
+
+        if not unavail_a and not unavail_l and not unavail_e and assets is not None and liab is not None and eq is not None:
+            expected = liab + eq
+            discrepancy = abs(assets - expected)
+            scale = max(abs(assets), 1.0)
+            rel_error = discrepancy / scale
+
+            if rel_error <= 0.02:
+                audit_items.append(
+                    f"<b>FY {a.year} Balance Sheet Equation:</b> Verified (Total Assets = Liabilities + Equity within 2% margin)."
+                )
+            else:
+                audit_items.append(
+                    f"<b>FY {a.year} Balance Sheet Equation:</b> Discrepancy detected (Total Assets {assets:,.1f} vs. Liabilities + Equity {expected:,.1f}, difference of {discrepancy:,.1f})."
+                )
+        else:
+            missing_components = []
+            if unavail_a or assets is None:
+                missing_components.append("Total Assets")
+            if unavail_l or liab is None:
+                missing_components.append("Total Liabilities")
+            if unavail_e or eq is None:
+                missing_components.append("Shareholders' Equity")
+            missing_str = ", ".join(missing_components) if missing_components else "Balance Sheet items"
+            audit_items.append(
+                f"<b>FY {a.year} Balance Sheet Equation:</b> Check could not be completed because {missing_str} was not reported."
+            )
+
+    # Include actual extraction notes from the report
+    if getattr(report, "extraction_notes", None):
+        for note in report.extraction_notes:
+            audit_items.append(f"<b>Extraction Note:</b> {_escape_xml(note)}")
+
+    audit_items.append(
+        "<b>Methodological Guardrails:</b> Missing metrics are flagged as Unavailable; zero values and missing figures are strictly segregated without synthetic extrapolation."
+    )
+
+    for aitem in audit_items:
+        story.append(Paragraph(f"• {aitem}", bullet_style))
 
     # Build PDF with two-pass canvas
     doc.build(story, canvasmaker=_FinSightNumberedCanvas)
     return buffer.getvalue()
-

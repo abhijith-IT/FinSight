@@ -378,5 +378,127 @@ class TestDashboardCachingAndPerformance(unittest.TestCase):
         self.assertEqual(st.session_state.extraction_report.company_name, "Preserved Corp")
 
 
+class TestModelSelectionAndConfiguration(unittest.TestCase):
+    """Test Gemini model selection index resolution, fallback handling, and centralized configuration."""
+
+    def setUp(self) -> None:
+        from app import get_model_selection_index
+        import config
+        self.get_model_idx = get_model_selection_index
+        self.supported = getattr(config, "SUPPORTED_GEMINI_MODELS", [])
+
+    def test_supported_models_centralized_definition(self) -> None:
+        """Verify centralized list contains the 4 required Gemini models in priority order."""
+        import config
+        expected = ["gemini-3.8-flash", "gemini-3.5-flash-lite", "gemini-2.5-flash", "gemini-2.5-pro"]
+        self.assertEqual(config.SUPPORTED_GEMINI_MODELS, expected)
+        self.assertEqual(config.DEFAULT_PRIMARY_MODEL, "gemini-3.8-flash")
+        self.assertEqual(config.DEFAULT_FALLBACK_MODEL, "gemini-3.5-flash-lite")
+
+    def test_get_model_selection_index_all_models(self) -> None:
+        """Verify that every supported model maps to its exact distinct index (fixing the bug)."""
+        # Bug fix verification: previously index was 0 for 3.8-flash and 1 for EVERYTHING else!
+        self.assertEqual(self.get_model_idx("gemini-3.8-flash", self.supported), 0)
+        self.assertEqual(self.get_model_idx("gemini-3.5-flash-lite", self.supported), 1)
+        self.assertEqual(self.get_model_idx("gemini-2.5-flash", self.supported), 2)
+        self.assertEqual(self.get_model_idx("gemini-2.5-pro", self.supported), 3)
+
+    def test_get_model_selection_index_unsupported_and_none_fallback(self) -> None:
+        """Verify unsupported model names and None safely fall back to index 0."""
+        self.assertEqual(self.get_model_idx("unsupported-gemini-model", self.supported), 0)
+        self.assertEqual(self.get_model_idx(None, self.supported), 0)
+        self.assertEqual(self.get_model_idx("", self.supported), 0)
+
+    def test_effective_fallback_model_resolution(self) -> None:
+        """Verify get_effective_fallback_model does not select primary model as its own fallback."""
+        import config
+        # When primary is 3.8-flash, fallback is 3.5-flash-lite
+        self.assertEqual(config.get_effective_fallback_model("gemini-3.8-flash"), "gemini-3.5-flash-lite")
+        # When primary is 3.5-flash-lite, fallback cannot be itself; switches to 2.5-flash
+        self.assertEqual(config.get_effective_fallback_model("gemini-3.5-flash-lite"), "gemini-2.5-flash")
+        # When primary is 2.5-flash, fallback is 3.5-flash-lite
+        self.assertEqual(config.get_effective_fallback_model("gemini-2.5-flash"), "gemini-3.5-flash-lite")
+
+
+class TestKPIFormattingAndEdgeCases(unittest.TestCase):
+    """Test KPI formatting edge cases including negative values, zero preservation, and tooltips."""
+
+    def test_negative_values_preserved_in_currency_and_pct(self) -> None:
+        """Verify negative net profits and losses are clearly formatted and preserved."""
+        # Net loss formatting
+        self.assertEqual(format_currency_value(-2500.5, "USD", "millions"), "USD -2,500.50 millions")
+        # Negative margin formatting
+        self.assertEqual(format_pct_value(-14.32), "-14.32%")
+
+    def test_zero_values_preserved_distinct_from_unavailable(self) -> None:
+        """Verify genuine 0.0 values are not converted to 'Unavailable' or lost."""
+        self.assertEqual(format_currency_value(0.0, "INR", "Crore"), "INR 0.00 Crore")
+        self.assertEqual(format_pct_value(0.0), "0.00%")
+        self.assertEqual(format_ratio_value(0.0), "0.00x")
+
+        # By contrast, None must strictly be 'Unavailable'
+        self.assertEqual(format_currency_value(None, "INR", "Crore"), "Unavailable")
+        self.assertEqual(format_pct_value(None), "Unavailable")
+        self.assertEqual(format_ratio_value(None), "Unavailable")
+
+
+class TestDashboardDarkThemeAndLandingPage(unittest.TestCase):
+    """Test Dark Financial Dashboard configuration, Plotly dark layout parameters, and landing view."""
+
+    def test_dark_plot_layout_specification(self) -> None:
+        """Verify Plotly dark theme layout has consistent deep navy surfaces and contrasting text."""
+        from app import DARK_PLOT_LAYOUT
+        self.assertEqual(DARK_PLOT_LAYOUT["paper_bgcolor"], "#111827")
+        self.assertEqual(DARK_PLOT_LAYOUT["plot_bgcolor"], "#111827")
+        self.assertEqual(DARK_PLOT_LAYOUT["font"]["color"], "#F8FAFC")
+        self.assertEqual(DARK_PLOT_LAYOUT["xaxis"]["gridcolor"], "#1F2937")
+        self.assertEqual(DARK_PLOT_LAYOUT["yaxis"]["gridcolor"], "#1F2937")
+
+    def test_streamlit_config_toml_dark_theme(self) -> None:
+        """Verify .streamlit/config.toml enforces dark base theme, electric cyan primary, and deep charcoal."""
+        import os
+        config_path = os.path.join(os.path.dirname(__file__), "..", ".streamlit", "config.toml")
+        self.assertTrue(os.path.exists(config_path), ".streamlit/config.toml must exist")
+        with open(config_path, "r", encoding="utf-8") as f:
+            content = f.read()
+        self.assertIn('base = "dark"', content)
+        self.assertIn('backgroundColor = "#0B0F19"', content)
+        self.assertIn('secondaryBackgroundColor = "#111827"', content)
+        self.assertIn('primaryColor = "#38BDF8"', content)
+
+    def test_landing_page_hero_text_alignment_and_container(self) -> None:
+        """Verify landing page hero heading and subtitle alignment, container, and balanced wrapping."""
+        import os
+        app_path = os.path.join(os.path.dirname(__file__), "..", "app.py")
+        with open(app_path, "r", encoding="utf-8") as f:
+            app_code = f.read()
+
+        # 1. Header container has flex centering and text-align: center
+        self.assertIn(".landing-header {", app_code)
+        self.assertIn("display: flex;", app_code)
+        self.assertIn("flex-direction: column;", app_code)
+        self.assertIn("align-items: center;", app_code)
+        self.assertIn("justify-content: center;", app_code)
+
+        # 2. Subtitle container has responsive max-width and centered margins
+        self.assertIn(".landing-subtitle-container {", app_code)
+        self.assertIn("max-width: 640px;", app_code)
+        self.assertIn("margin-left: auto;", app_code)
+        self.assertIn("margin-right: auto;", app_code)
+
+        # 3. Subtitle has text-wrap: balance and explicit center alignment
+        self.assertIn(".landing-subtitle {", app_code)
+        self.assertIn("text-wrap: balance;", app_code)
+        self.assertIn("text-align: center;", app_code)
+
+        # 4. Heading is horizontally centered
+        self.assertIn(".landing-title {", app_code)
+        self.assertIn("text-align: center;", app_code)
+
+        # 5. render_landing_page markup nests subtitle within responsive container
+        self.assertIn('<div class="landing-subtitle-container">', app_code)
+        self.assertIn('<p class="landing-subtitle">', app_code)
+
+
 if __name__ == "__main__":
     unittest.main()
